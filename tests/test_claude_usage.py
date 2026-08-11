@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Offline-tester för bin/claude-usage.
+
+Kör skriptet som en riktig subprocess mot en lokal stubbserver, så att det som
+testas är exakt det CLI som tillägget anropar. Inga nätverksanrop utanför
+localhost, inga beroenden utanför stdlib.
+
+    python3 -m unittest discover -s tests -v
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(REPO_ROOT, "bin", "claude-usage")
+
+TOKEN = "sk-ant-oat01-TOPSECRET-TOKEN-VALUE-do-not-log"
+
+# Formen som är publikt rapporterad, plus två nycklar parsern aldrig sett förut
+# och en nyckel utan utilization — inget av det får krascha eller tappas bort.
+SAMPLE = {
+    "five_hour": {"utilization": 42, "resets_at": "2026-08-11T22:00:00Z"},
+    "seven_day": {"utilization": 67, "resets_at": "2026-08-15T09:30:00+00:00"},
+    "seven_day_opus": {"utilization": 91.5, "resets_at": "2026-08-15T09:30:00Z"},
+    "seven_day_cowork": {"utilization": 0, "resets_at": "2026-08-15T09:30:00Z"},
+    "thirty_day_fable": {"utilization": 12, "resets_at": 1786000000},
+    "wibble_frotz": {"utilization": 5, "resets_at": None},
+    "extra_usage": {"used_credits": 1.5, "credit_limit": 25, "enabled": True},
+    "account_uuid": "abc-123",
+    "some_unparsed_object": {"note": "no utilization here"},
+}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        server = self.server
+        server.requests.append(
+            {
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "beta": self.headers.get("anthropic-beta"),
+                "user_agent": self.headers.get("User-Agent"),
+            }
+        )
+        status, content_type, body = server.responder(len(server.requests))
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        if status == 429:
+            self.send_header("Retry-After", "37")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):  # tysta testutdata
+        pass
+
+
+class StubServer:
+    def __init__(self, responder):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.httpd.responder = responder
+        self.httpd.requests = []
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        host, port = self.httpd.server_address[:2]
+        return "http://%s:%d/api/oauth/usage" % (host, port)
+
+    @property
+    def requests(self):
+        return self.httpd.requests
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+def ok_json(_n):
+    return 200, "application/json", json.dumps(SAMPLE)
+
+
+class UsageTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-usage-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self.runtime = os.path.join(self.tmp, "runtime")
+        os.makedirs(self.runtime, mode=0o700)
+
+        self.creds = os.path.join(self.tmp, "credentials.json")
+        self.write_creds(TOKEN, expires_at=4_000_000_000_000)
+
+        self.server = None
+
+    def write_creds(self, token, expires_at=4_000_000_000_000, raw=None):
+        with open(self.creds, "w", encoding="utf-8") as fh:
+            if raw is not None:
+                fh.write(raw)
+            else:
+                json.dump(
+                    {
+                        "claudeAiOauth": {
+                            "accessToken": token,
+                            "expiresAt": expires_at,
+                            "refreshToken": "sk-ant-ort01-REFRESH-SECRET",
+                            "scopes": ["user:inference"],
+                        }
+                    },
+                    fh,
+                )
+
+    def serve(self, responder):
+        self.server = StubServer(responder)
+        self.addCleanup(self.server.close)
+        return self.server
+
+    def run_script(self, *args, endpoint=None):
+        env = dict(os.environ)
+        env["XDG_RUNTIME_DIR"] = self.runtime
+        env["CLAUDE_USAGE_CREDENTIALS"] = self.creds
+        env["CLAUDE_USAGE_ENDPOINT"] = endpoint or (
+            self.server.url if self.server else "http://127.0.0.1:1/nope"
+        )
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            env.pop(key, None)
+        env["NO_PROXY"] = "*"
+        env["no_proxy"] = "*"
+        return subprocess.run(
+            [sys.executable, SCRIPT, *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def run_json(self, *args, **kwargs):
+        result = self.run_script("--json", *args, **kwargs)
+        try:
+            return json.loads(result.stdout), result
+        except json.JSONDecodeError as exc:  # pragma: no cover
+            self.fail(
+                "--json gav ogiltig JSON (%s)\nstdout=%r\nstderr=%r"
+                % (exc, result.stdout, result.stderr)
+            )
+
+    def clear_cache(self):
+        target = os.path.join(self.runtime, "claude-usage", "usage.json")
+        if os.path.exists(target):
+            os.unlink(target)
+
+
+class TestHappyPath(UsageTestCase):
+    def test_json_shape_and_generic_parsing(self):
+        self.serve(ok_json)
+        payload, result = self.run_json("--force")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["stale"])
+        self.assertIsNone(payload["error"])
+        self.assertFalse(payload["endpoint_documented"])
+
+        keys = [limit["key"] for limit in payload["limits"]]
+        # Alla sex utilization-nycklar med — credits ligger separat.
+        self.assertCountEqual(
+            keys,
+            [
+                "five_hour",
+                "seven_day",
+                "seven_day_opus",
+                "seven_day_cowork",
+                "thirty_day_fable",
+                "wibble_frotz",
+            ],
+        )
+        # Sortering: kortaste fönstret först, generell före modellspecifik.
+        self.assertEqual(keys[0], "five_hour")
+        self.assertEqual(keys[1], "seven_day")
+        self.assertLess(keys.index("seven_day"), keys.index("seven_day_opus"))
+        # Okänd nyckel utan fönster hamnar sist, inte bortkastad.
+        self.assertEqual(keys[-1], "wibble_frotz")
+
+    def test_headers_sent(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        request = self.server.requests[0]
+        self.assertEqual(request["authorization"], "Bearer %s" % TOKEN)
+        self.assertEqual(request["beta"], "oauth-2025-04-20")
+        self.assertTrue(request["user_agent"])
+
+    def test_labels_for_known_and_unknown_keys(self):
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        labels = {limit["key"]: limit["label"] for limit in payload["limits"]}
+
+        self.assertEqual(labels["five_hour"], "Session (5 h)")
+        self.assertEqual(labels["seven_day"], "Vecka – alla modeller")
+        self.assertEqual(labels["seven_day_opus"], "Vecka – Opus")
+        # Aldrig sedda nycklar får autogenererade namn, inte tomma strängar.
+        self.assertEqual(labels["thirty_day_fable"], "30 dagar – Fable")
+        self.assertEqual(labels["wibble_frotz"], "Wibble frotz")
+        for label in labels.values():
+            self.assertTrue(label.strip())
+
+        known = {limit["key"]: limit["known"] for limit in payload["limits"]}
+        self.assertTrue(known["five_hour"])
+        self.assertFalse(known["thirty_day_fable"])
+
+    def test_percent_and_severity(self):
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+
+        self.assertAlmostEqual(by_key["five_hour"]["percent"], 42.0)
+        self.assertEqual(by_key["five_hour"]["severity"], "ok")
+        self.assertEqual(by_key["seven_day"]["severity"], "ok")
+        self.assertEqual(by_key["seven_day_opus"]["severity"], "crit")
+        self.assertAlmostEqual(payload["max_percent"], 91.5)
+        self.assertEqual(payload["max_severity"], "crit")
+
+    def test_severity_thresholds_at_70_and_90(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "a_five_minute": {"utilization": 69.9},
+                        "b_five_minute": {"utilization": 70},
+                        "c_five_minute": {"utilization": 89.9},
+                        "d_five_minute": {"utilization": 90},
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        got = {limit["key"]: limit["severity"] for limit in payload["limits"]}
+        self.assertEqual(got["a_five_minute"], "ok")
+        self.assertEqual(got["b_five_minute"], "warn")
+        self.assertEqual(got["c_five_minute"], "warn")
+        self.assertEqual(got["d_five_minute"], "crit")
+
+    def test_resets_at_formats(self):
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+
+        # ISO med Z, ISO med offset och epoch-sekunder ska alla ge en epoch.
+        # 1786485600 == 2026-08-11T22:00:00Z
+        self.assertAlmostEqual(
+            by_key["five_hour"]["resets_at_epoch"], 1786485600.0, places=0
+        )
+        # 1786786200 == 2026-08-15T09:30:00Z — Z och +00:00 ska ge samma svar.
+        self.assertAlmostEqual(
+            by_key["seven_day"]["resets_at_epoch"], 1786786200.0, places=0
+        )
+        self.assertAlmostEqual(
+            by_key["seven_day_opus"]["resets_at_epoch"],
+            by_key["seven_day"]["resets_at_epoch"],
+            places=0,
+        )
+        self.assertAlmostEqual(
+            by_key["thirty_day_fable"]["resets_at_epoch"], 1786000000.0, places=0
+        )
+        # null resets_at ska ge None, inte krascha.
+        self.assertIsNone(by_key["wibble_frotz"]["resets_at_epoch"])
+        self.assertIsNone(by_key["wibble_frotz"]["resets_in_seconds"])
+
+    def test_epoch_milliseconds_are_detected(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps({"five_hour": {"utilization": 1, "resets_at": 1786000000000}}),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertAlmostEqual(
+            payload["limits"][0]["resets_at_epoch"], 1786000000.0, places=0
+        )
+
+    def test_credits_rendered_separately(self):
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        credits = payload["credits"]
+
+        self.assertIsNotNone(credits)
+        self.assertEqual(credits["key"], "extra_usage")
+        self.assertEqual(credits["label"], "Credits")
+        fields = {field["key"]: field["value"] for field in credits["fields"]}
+        self.assertEqual(fields["used_credits"], "1.5")
+        self.assertEqual(fields["credit_limit"], "25")
+        self.assertEqual(fields["enabled"], "ja")
+        # Credits ligger inte bland gränserna.
+        self.assertNotIn("extra_usage", [l["key"] for l in payload["limits"]])
+
+    def test_non_limit_keys_reported_not_dropped(self):
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        reported = {item["key"] for item in payload["unrecognized"]}
+        self.assertIn("account_uuid", reported)
+        self.assertIn("some_unparsed_object", reported)
+
+    def test_nested_container_is_found(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps({"usage": {"five_hour": {"utilization": 33}}}),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertEqual([l["key"] for l in payload["limits"]], ["five_hour"])
+        self.assertAlmostEqual(payload["max_percent"], 33.0)
+
+    def test_text_output_is_readable(self):
+        self.serve(ok_json)
+        result = self.run_script("--text", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+
+        self.assertIn("Claude usage", out)
+        self.assertIn("Session (5 h)", out)
+        self.assertIn("Vecka – Opus", out)
+        self.assertIn("Credits", out)
+        self.assertIn("42 %", out)
+        self.assertIn("█", out)
+        self.assertIn("återställs om", out)
+        self.assertIn("odokumenterad", out)
+        self.assertGreaterEqual(len(out.strip().splitlines()), 8)
+
+    def test_text_is_default_mode(self):
+        self.serve(ok_json)
+        result = self.run_script("--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Session (5 h)", result.stdout)
+
+    def test_raw_prints_pure_json_to_stdout(self):
+        self.serve(ok_json)
+        result = self.run_script("--raw", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), SAMPLE)
+
+
+class TestCaching(UsageTestCase):
+    def test_cache_file_is_0600(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        path = os.path.join(self.runtime, "claude-usage", "usage.json")
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_cache_dir_is_0700_under_xdg_runtime_dir(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        path = os.path.join(self.runtime, "claude-usage")
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+
+    def test_second_call_within_ttl_makes_no_request(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        self.assertEqual(len(self.server.requests), 1)
+
+        payload, _ = self.run_json()  # utan --force
+        self.assertEqual(len(self.server.requests), 1, "TTL respekterades inte")
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["stale"])
+        self.assertEqual(payload["source"], "cache")
+
+    def test_source_reflects_whether_a_request_happened(self):
+        def responder(n):
+            if n == 1:
+                return 200, "application/json", json.dumps(SAMPLE)
+            return 429, "application/json", "{}"
+
+        self.serve(responder)
+        fresh, _ = self.run_json("--force")
+        self.assertEqual(fresh["source"], "network")
+
+        cached, _ = self.run_json()  # inom TTL, inget anrop
+        self.assertEqual(cached["source"], "cache")
+
+        # Ett anrop som misslyckades räknas som cache — siffrorna är cachade.
+        self.age_cache(3600)
+        failed, _ = self.run_json()
+        self.assertEqual(failed["source"], "cache")
+        self.assertTrue(failed["ok"])
+
+    def age_cache(self, seconds):
+        path = os.path.join(self.runtime, "claude-usage", "usage.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        for key in ("fetched_at", "last_attempt_at"):
+            if isinstance(state.get(key), (int, float)):
+                state[key] -= seconds
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+
+    def test_force_bypasses_ttl_but_not_the_hard_floor(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        self.assertEqual(len(self.server.requests), 1)
+        # Direkt efter varandra: golvet (15 s) hindrar ett andra anrop.
+        self.run_json("--force")
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_cache_never_contains_the_token(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        path = os.path.join(self.runtime, "claude-usage", "usage.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            contents = fh.read()
+        self.assertNotIn(TOKEN, contents)
+        self.assertNotIn("REFRESH-SECRET", contents)
+
+
+class TestResilience(UsageTestCase):
+    """Tillägget ska överleva alla dessa lägen — inget tomt fel."""
+
+    def test_429_serves_cached_data_with_stale_flag(self):
+        state = {"n": 0}
+
+        def responder(n):
+            state["n"] = n
+            if n == 1:
+                return 200, "application/json", json.dumps(SAMPLE)
+            return 429, "application/json", '{"error":"rate_limited"}'
+
+        self.serve(responder)
+        first, _ = self.run_json("--force")
+        self.assertTrue(first["ok"])
+
+        # Nollställ tiden i cachen så att TTL inte döljer nästa försök.
+        self.age_cache(3600)
+        payload, result = self.run_json()
+
+        self.assertGreaterEqual(len(self.server.requests), 2)
+        self.assertTrue(payload["ok"], "cachad data ska serveras vid 429")
+        self.assertTrue(payload["stale"])
+        self.assertEqual(payload["error"]["kind"], "rate_limited")
+        self.assertEqual(payload["error"]["retry_after"], "37")
+        self.assertEqual(payload["limits"][0]["key"], "five_hour")
+        self.assertEqual(result.returncode, 0)
+
+    def test_429_with_no_cache_reports_error_not_crash(self):
+        self.serve(lambda n: (429, "application/json", "{}"))
+        payload, result = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["stale"])
+        self.assertEqual(payload["error"]["kind"], "rate_limited")
+        self.assertEqual(payload["limits"], [])
+        self.assertEqual(result.returncode, 1)
+
+    def test_network_error_serves_cached_data(self):
+        self.serve(ok_json)
+        self.run_json("--force")
+        self.age_cache(3600)
+
+        # Peka om till en stängd port -> connection refused.
+        payload, _ = self.run_json(endpoint="http://127.0.0.1:1/api/oauth/usage")
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["stale"])
+        self.assertEqual(payload["error"]["kind"], "network_error")
+        self.assertEqual(payload["limits"][0]["key"], "five_hour")
+
+    def test_html_response_is_reported_as_bad_response(self):
+        self.serve(
+            lambda n: (200, "text/html; charset=utf-8", "<html>Just a moment...</html>")
+        )
+        payload, _ = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "bad_response")
+        self.assertIn("text/html", payload["error"]["message"])
+        # Svarskroppen får inte läcka in i felmeddelandet.
+        self.assertNotIn("Just a moment", payload["error"]["message"])
+
+    def test_cloudflare_403_html_is_labelled_blocked(self):
+        self.serve(lambda n: (403, "text/html", "<html>blocked</html>"))
+        payload, _ = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "blocked")
+
+    def test_401_reports_token_problem(self):
+        self.serve(lambda n: (401, "application/json", '{"error":"unauthorized"}'))
+        payload, _ = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "unauthorized")
+        self.assertIn("401", payload["error"]["message"])
+
+    def test_500_serves_cached_data(self):
+        def responder(n):
+            if n == 1:
+                return 200, "application/json", json.dumps(SAMPLE)
+            return 503, "application/json", "{}"
+
+        self.serve(responder)
+        self.run_json("--force")
+        self.age_cache(3600)
+        payload, _ = self.run_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "server_error")
+
+    def test_expired_token_still_attempts_and_survives(self):
+        self.write_creds(TOKEN, expires_at=1000)  # långt i förflutet
+        self.serve(lambda n: (401, "application/json", "{}"))
+        payload, result = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "unauthorized")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.server.requests), 1, "borde ändå ha försökt")
+
+    def test_missing_credentials_file(self):
+        os.unlink(self.creds)
+        self.serve(ok_json)
+        payload, result = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "no_credentials")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.server.requests), 0)
+
+    def test_malformed_credentials_file(self):
+        self.write_creds(None, raw="{not json")
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        self.assertEqual(payload["error"]["kind"], "bad_credentials")
+
+    def test_credentials_without_token(self):
+        self.write_creds(None, raw=json.dumps({"claudeAiOauth": {"expiresAt": 1}}))
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        self.assertEqual(payload["error"]["kind"], "no_token")
+
+    def test_empty_object_response(self):
+        self.serve(lambda n: (200, "application/json", "{}"))
+        payload, _ = self.run_json("--force")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["limits"], [])
+        self.assertIsNone(payload["credits"])
+        self.assertIsNone(payload["max_percent"])
+
+    def test_json_array_response_is_rejected_cleanly(self):
+        self.serve(lambda n: (200, "application/json", "[1,2,3]"))
+        payload, _ = self.run_json("--force")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "bad_response")
+
+    def test_garbage_field_types_do_not_crash(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "five_hour": {"utilization": "42%", "resets_at": "not-a-date"},
+                        "seven_day": {"utilization": None},
+                        "eight_day": {"utilization": True},
+                        "nine_day": {"utilization": {"nested": 1}},
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, result = self.run_json("--force")
+        self.assertTrue(payload["ok"])
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+        self.assertAlmostEqual(by_key["five_hour"]["percent"], 42.0)
+        self.assertIsNone(by_key["five_hour"]["resets_at_epoch"])
+        # Otolkbara utilization-värden ger percent=None, inte krasch.
+        self.assertIsNone(by_key["seven_day"]["percent"])
+        self.assertEqual(by_key["seven_day"]["severity"], "unknown")
+        self.assertIsNone(by_key["eight_day"]["percent"])
+        self.assertIsNone(by_key["nine_day"]["percent"])
+        # Och texten går fortfarande att rendera.
+        text = self.run_script("--text")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("–", text.stdout)
+
+    def test_corrupt_cache_file_is_ignored(self):
+        cache_dir = os.path.join(self.runtime, "claude-usage")
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(os.path.join(cache_dir, "usage.json"), "w", encoding="utf-8") as fh:
+            fh.write("{{{ not json")
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        self.assertTrue(payload["ok"])
+
+    def test_works_without_xdg_runtime_dir(self):
+        self.serve(ok_json)
+        env = dict(os.environ)
+        env.pop("XDG_RUNTIME_DIR", None)
+        env["CLAUDE_USAGE_CREDENTIALS"] = self.creds
+        env["CLAUDE_USAGE_ENDPOINT"] = self.server.url
+        env["TMPDIR"] = os.path.join(self.tmp, "fallback")
+        os.makedirs(env["TMPDIR"], exist_ok=True)
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--json", "--force"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+
+    def age_cache(self, seconds):
+        """Backdatera cachen så att TTL/backoff inte döljer nästa försök."""
+        path = os.path.join(self.runtime, "claude-usage", "usage.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        for key in ("fetched_at", "last_attempt_at"):
+            if isinstance(state.get(key), (int, float)):
+                state[key] -= seconds
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+
+
+class TestTokenNeverLeaks(UsageTestCase):
+    SECRET_RE = re.compile(re.escape(TOKEN))
+
+    def assert_clean(self, result, label):
+        for stream_name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+            self.assertNotRegex(
+                stream or "",
+                self.SECRET_RE,
+                "token läckte i %s (%s)" % (stream_name, label),
+            )
+            self.assertNotIn("REFRESH-SECRET", stream or "")
+
+    def test_token_absent_from_all_output_modes(self):
+        self.serve(ok_json)
+        for args in (("--json", "--force"), ("--text",), ("--raw",)):
+            self.assert_clean(self.run_script(*args), " ".join(args))
+
+    def test_token_absent_on_every_failure_mode(self):
+        cases = {
+            "429": lambda n: (429, "application/json", "{}"),
+            "401": lambda n: (401, "application/json", '{"detail":"bad token"}'),
+            "html": lambda n: (200, "text/html", "<html>x</html>"),
+            "500": lambda n: (500, "application/json", "{}"),
+        }
+        for label, responder in cases.items():
+            with self.subTest(case=label):
+                self.clear_cache()
+                server = StubServer(responder)
+                self.addCleanup(server.close)
+                self.server = server
+                for args in (("--json", "--force"), ("--text", "--force")):
+                    self.assert_clean(self.run_script(*args), "%s %s" % (label, args))
+
+    def test_token_absent_when_endpoint_echoes_it_back(self):
+        # Ett elakt svar som innehåller token ska inte kunna skrivas ut ordagrant
+        # i felmeddelanden. (Rå data är per definition serverns svar och visas
+        # bara i --raw, som användaren uttryckligen ber om.)
+        self.serve(
+            lambda n: (500, "application/json", json.dumps({"echo": "Bearer " + TOKEN}))
+        )
+        result = self.run_script("--json", "--force")
+        self.assert_clean(result, "echo")
+
+    def test_network_error_message_is_scrubbed(self):
+        payload, result = self.run_json(
+            "--force", endpoint="http://127.0.0.1:1/api/oauth/usage"
+        )
+        self.assertEqual(payload["error"]["kind"], "network_error")
+        self.assert_clean(result, "network")
+
+
+class TestCliContract(UsageTestCase):
+    def test_help_works(self):
+        result = self.run_script("--help")
+        self.assertEqual(result.returncode, 0)
+        for flag in ("--raw", "--json", "--text", "--force"):
+            self.assertIn(flag, result.stdout)
+
+    def test_output_modes_are_mutually_exclusive(self):
+        result = self.run_script("--json", "--text")
+        self.assertEqual(result.returncode, 2)
+
+    def test_json_is_always_parseable_even_on_failure(self):
+        os.unlink(self.creds)
+        result = self.run_script("--json", "--force")
+        payload = json.loads(result.stdout)  # får inte kasta
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
+        # Fälten som tillägget läser finns alltid.
+        for key in ("schema", "ok", "stale", "limits", "credits", "error"):
+            self.assertIn(key, payload)
+
+    def test_script_is_executable_and_has_python3_shebang(self):
+        self.assertTrue(os.access(SCRIPT, os.X_OK), "bin/claude-usage måste vara +x")
+        with open(SCRIPT, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.readline().strip(), "#!/usr/bin/env python3")
+
+    def test_stdlib_only(self):
+        with open(SCRIPT, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        imported = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_.]+)", source, re.M))
+        allowed = {
+            "__future__", "argparse", "json", "os", "re", "sys", "tempfile",
+            "time", "urllib.error", "urllib.request", "datetime",
+        }
+        self.assertTrue(
+            imported <= allowed, "otillåtna importer: %s" % (imported - allowed)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

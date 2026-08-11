@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""claude-usage — läs användningsgränserna för en Claude-prenumeration.
+
+Hämtar https://claude.ai/api/oauth/usage med OAuth-token från
+~/.claude/.credentials.json, normaliserar svaret och cachar det i
+$XDG_RUNTIME_DIR.
+
+Endpointen är ODOKUMENTERAD. Fältnamn kan ändras eller försvinna utan
+förvarning, därför är parsern helt generisk: varje toppnyckel vars värde är
+ett objekt med ett utilization-fält blir en gräns, oavsett om namnet är känt.
+
+Skriptet läser aldrig annat än accessToken ur credentials-filen och skriver
+aldrig till den. Token förekommer aldrig i utdata, loggar eller felmeddelanden.
+
+Endast Python-stdlib.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+# --------------------------------------------------------------------------
+# Konfiguration
+# --------------------------------------------------------------------------
+
+#: Odokumenterad endpoint. Överskrivbar via env för test.
+ENDPOINT = os.environ.get(
+    "CLAUDE_USAGE_ENDPOINT", "https://claude.ai/api/oauth/usage"
+)
+BETA_HEADER = "oauth-2025-04-20"
+
+CREDENTIALS_PATH = os.environ.get(
+    "CLAUDE_USAGE_CREDENTIALS",
+    os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json"),
+)
+
+#: Vissa CDN:er avvisar tomma/okända User-Agents. Överskrivbar om du får 403 HTML.
+USER_AGENT = os.environ.get("CLAUDE_USAGE_USER_AGENT", "claude-usage/1.0")
+
+#: Minsta tid mellan riktiga nätverksanrop vid automatisk pollning.
+CACHE_TTL = 60.0
+#: Golv även när --force används, så att "Uppdatera nu" inte kan hamra endpointen.
+FORCE_MIN_INTERVAL = 15.0
+#: Efter ett misslyckat anrop: vänta så här länge innan nytt försök (utan --force).
+ERROR_BACKOFF = 30.0
+#: Cachad data äldre än detta markeras som stale även utan fel.
+STALE_AFTER = 300.0
+
+HTTP_TIMEOUT = 10.0
+MAX_BODY = 2_000_000
+SCHEMA = 1
+
+OK_AT, WARN_AT, CRIT_AT = 0.0, 70.0, 90.0
+
+# --------------------------------------------------------------------------
+# Etiketter
+# --------------------------------------------------------------------------
+
+#: Kända nycklar -> etikett. Allt som INTE står här får ett autogenererat namn
+#: av humanize_key() och tappas alltså aldrig bort.
+KNOWN_LABELS = {
+    "five_hour": "Session (5 h)",
+    "seven_day": "Vecka – alla modeller",
+    "seven_day_opus": "Vecka – Opus",
+    "seven_day_sonnet": "Vecka – Sonnet",
+    "seven_day_haiku": "Vecka – Haiku",
+    "seven_day_cowork": "Vecka – Cowork",
+    "seven_day_oauth_apps": "Vecka – OAuth-appar",
+    "extra_usage": "Credits",
+}
+
+#: Nycklar som ska renderas som credits-rad (sist), inte som en vanlig gräns.
+CREDIT_KEYS = {"extra_usage"}
+CREDIT_PATTERNS = ("credit", "extra_usage")
+
+#: Fält som identifierar en gräns. Första träffen används som procentvärde.
+UTIL_FIELDS = (
+    "utilization",
+    "utilisation",
+    "utilization_percent",
+    "percent_used",
+    "percent",
+)
+
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30,
+    "sixty": 60, "ninety": 90,
+}
+
+UNIT_WORDS = {
+    "second": ("sekund", "sekunder", 1),
+    "minute": ("minut", "minuter", 60),
+    "hour": ("timme", "timmar", 3600),
+    "day": ("dag", "dagar", 86400),
+    "week": ("vecka", "veckor", 604800),
+    "month": ("månad", "månader", 2592000),
+}
+
+MODEL_NAMES = {
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "fable": "Fable",
+    "cowork": "Cowork",
+    "oauth_apps": "OAuth-appar",
+}
+
+_WINDOW_RE = re.compile(
+    r"^(?P<num>[a-z]+|\d+)_(?P<unit>second|minute|hour|day|week|month)s?"
+    r"(?:_(?P<suffix>.+))?$"
+)
+
+
+def parse_window(key: str):
+    """('seven_day_opus') -> (604800, 'opus'). Okänd form -> (None, None)."""
+    m = _WINDOW_RE.match(key)
+    if not m:
+        return None, None
+    raw_num = m.group("num")
+    if raw_num.isdigit():
+        count = int(raw_num)
+    elif raw_num in NUMBER_WORDS:
+        count = NUMBER_WORDS[raw_num]
+    else:
+        return None, None
+    unit = m.group("unit")
+    return count * UNIT_WORDS[unit][2], m.group("suffix")
+
+
+def humanize_key(key: str) -> str:
+    """Autogenererad etikett för en okänd nyckel — aldrig tom."""
+    if key in KNOWN_LABELS:
+        return KNOWN_LABELS[key]
+
+    m = _WINDOW_RE.match(key)
+    if m:
+        raw_num = m.group("num")
+        count = int(raw_num) if raw_num.isdigit() else NUMBER_WORDS.get(raw_num)
+        if count is not None:
+            singular, plural, _ = UNIT_WORDS[m.group("unit")]
+            base = f"{count} {singular if count == 1 else plural}"
+            suffix = m.group("suffix")
+            if suffix:
+                base += " – " + MODEL_NAMES.get(suffix, humanize_field(suffix))
+            return base
+
+    return humanize_field(key)
+
+
+def humanize_field(key: str) -> str:
+    """'monthly_limit' -> 'Monthly limit'. Sista utposten; tappar inget."""
+    text = str(key).replace("_", " ").replace("-", " ").strip()
+    if not text:
+        return str(key)
+    return text[0].upper() + text[1:]
+
+
+def is_credit_key(key: str) -> bool:
+    lowered = key.lower()
+    if lowered in CREDIT_KEYS:
+        return True
+    return any(pattern in lowered for pattern in CREDIT_PATTERNS)
+
+
+def severity(percent) -> str:
+    if percent is None:
+        return "unknown"
+    if percent >= CRIT_AT:
+        return "crit"
+    if percent >= WARN_AT:
+        return "warn"
+    return "ok"
+
+
+# --------------------------------------------------------------------------
+# Token
+# --------------------------------------------------------------------------
+
+
+class UsageError(Exception):
+    """Fel som ska visas för användaren. `kind` är stabil, `message` är text."""
+
+    def __init__(self, kind: str, message: str, retry_after=None):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.retry_after = retry_after
+
+    def as_dict(self):
+        out = {"kind": self.kind, "message": self.message}
+        if self.retry_after is not None:
+            out["retry_after"] = self.retry_after
+        return out
+
+
+def scrub(text, token=None) -> str:
+    """Ta bort allt som kan vara en hemlighet ur en sträng."""
+    if text is None:
+        return ""
+    out = str(text)
+    if token:
+        out = out.replace(token, "<redacted>")
+    out = re.sub(r"(?i)(bearer\s+)\S+", r"\1<redacted>", out)
+    out = re.sub(r"sk-[A-Za-z0-9_\-]{6,}", "<redacted>", out)
+    return out
+
+
+def load_token():
+    """-> (token, expires_at_epoch|None). Filen läses, aldrig skrivs."""
+    try:
+        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise UsageError(
+            "no_credentials",
+            "Hittade inte %s — logga in med Claude Code först." % CREDENTIALS_PATH,
+        )
+    except PermissionError:
+        raise UsageError(
+            "no_credentials", "Får inte läsa %s (rättigheter)." % CREDENTIALS_PATH
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise UsageError(
+            "bad_credentials", "%s är inte giltig JSON." % CREDENTIALS_PATH
+        )
+    except OSError as exc:
+        raise UsageError(
+            "bad_credentials",
+            "Kunde inte läsa %s: %s" % (CREDENTIALS_PATH, exc.strerror or "I/O-fel"),
+        )
+
+    section = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        raise UsageError(
+            "no_token",
+            "Ingen claudeAiOauth-sektion i %s." % CREDENTIALS_PATH,
+        )
+
+    token = section.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        raise UsageError(
+            "no_token", "Ingen accessToken i %s." % CREDENTIALS_PATH
+        )
+
+    expires_at = section.get("expiresAt")
+    expires_epoch = None
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        # expiresAt är millisekunder sedan epoch.
+        expires_epoch = float(expires_at) / 1000.0
+
+    return token.strip(), expires_epoch
+
+
+# --------------------------------------------------------------------------
+# Hämtning
+# --------------------------------------------------------------------------
+
+
+def fetch_raw(token: str):
+    """-> dict från servern. Kastar UsageError. Loggar aldrig token."""
+    request = urllib.request.Request(ENDPOINT, method="GET")
+    request.add_header("Authorization", "Bearer %s" % token)
+    request.add_header("anthropic-beta", BETA_HEADER)
+    request.add_header("Accept", "application/json")
+    request.add_header("User-Agent", USER_AGENT)
+
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            status = response.getcode()
+            content_type = response.headers.get("Content-Type", "") or ""
+            body = response.read(MAX_BODY)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        content_type = ""
+        retry_after = None
+        try:
+            content_type = exc.headers.get("Content-Type", "") or ""
+            retry_after = exc.headers.get("Retry-After")
+        except Exception:  # pragma: no cover - defensivt
+            pass
+        try:
+            exc.close()
+        except Exception:  # pragma: no cover - defensivt
+            pass
+
+        if status == 429:
+            raise UsageError(
+                "rate_limited",
+                "Rate limitad av servern (429).",
+                retry_after=retry_after,
+            )
+        if status == 401:
+            raise UsageError(
+                "unauthorized",
+                "Token avvisades (401) — kör ett Claude Code-kommando så "
+                "förnyas den.",
+            )
+        if status == 403:
+            if "html" in content_type.lower():
+                raise UsageError(
+                    "blocked",
+                    "Blockerad före API:et (403, HTML-svar) — troligen ett "
+                    "bot-skydd, inte din token.",
+                )
+            raise UsageError(
+                "forbidden",
+                "Servern nekade åtkomst (403) — kontot kanske saknar den här "
+                "endpointen.",
+            )
+        if 500 <= status < 600:
+            raise UsageError(
+                "server_error", "Serverfel (HTTP %d)." % status
+            )
+        raise UsageError("http_error", "Oväntad HTTP-status %d." % status)
+    except urllib.error.URLError as exc:
+        raise UsageError(
+            "network_error",
+            "Nätverksfel: %s" % (scrub(exc.reason, token) or "okänd orsak"),
+        )
+    except TimeoutError:
+        raise UsageError(
+            "network_error", "Tidsgräns på %.0f s överskreds." % HTTP_TIMEOUT
+        )
+    except OSError as exc:
+        raise UsageError("network_error", "Nätverksfel: %s" % scrub(exc, token))
+
+    # Svarskroppen loggas aldrig — bara typ och status, så att varken token
+    # eller kontodata kan läcka via felmeddelanden.
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise UsageError(
+            "bad_response",
+            "Svaret gick inte att avkoda som UTF-8 (HTTP %d)." % status,
+        )
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        label = content_type.split(";")[0].strip() or "okänt innehåll"
+        raise UsageError(
+            "bad_response",
+            "Servern svarade med %s i stället för JSON (HTTP %d)." % (label, status),
+        )
+
+    if not isinstance(parsed, dict):
+        raise UsageError(
+            "bad_response",
+            "Servern svarade med %s på toppnivån, väntade objekt."
+            % type(parsed).__name__,
+        )
+    return parsed
+
+
+# --------------------------------------------------------------------------
+# Cache
+# --------------------------------------------------------------------------
+
+
+def cache_dir() -> str:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.isdir(base):
+        path = os.path.join(base, "claude-usage")
+    else:
+        path = os.path.join(
+            tempfile.gettempdir(), "claude-usage-%d" % os.getuid()
+        )
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def cache_path() -> str:
+    return os.path.join(cache_dir(), "usage.json")
+
+
+def read_cache() -> dict:
+    try:
+        with open(cache_path(), "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {}
+    if not isinstance(state, dict) or state.get("schema") != SCHEMA:
+        return {}
+    return state
+
+
+def write_cache(state: dict) -> None:
+    """Atomisk skrivning med 0600. Fel här får aldrig fälla programmet."""
+    path = cache_path()
+    tmp_name = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".usage-")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.replace(tmp_name, path)
+        tmp_name = None
+    except OSError:
+        pass
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Normalisering
+# --------------------------------------------------------------------------
+
+
+def to_percent(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().rstrip("%").replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def to_epoch(value):
+    """Tål epoch (s eller ms), ISO 8601 och några vanliga varianter."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number <= 0:
+            return None
+        return number / 1000.0 if number > 1e11 else number
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return to_epoch(float(text))
+
+    text = text.replace("Z", "+00:00").replace("z", "+00:00")
+    # Trimma nanosekunder till mikrosekunder — fromisoformat tål bara 3 el. 6.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def pick_util(entry: dict):
+    for field in UTIL_FIELDS:
+        if field in entry:
+            percent = to_percent(entry[field])
+            if percent is not None:
+                return percent, field
+    return None, None
+
+
+def has_util_field(entry) -> bool:
+    return isinstance(entry, dict) and any(field in entry for field in UTIL_FIELDS)
+
+
+def pick_reset(entry: dict):
+    """Hitta återställningstiden utan att anta exakt fältnamn."""
+    for field in ("resets_at", "reset_at", "resets", "reset", "next_reset_at"):
+        if field in entry:
+            epoch = to_epoch(entry[field])
+            if epoch is not None:
+                return epoch, entry[field]
+    for key, value in entry.items():
+        if "reset" in key.lower():
+            epoch = to_epoch(value)
+            if epoch is not None:
+                return epoch, value
+    return None, None
+
+
+def limit_containers(raw: dict):
+    """Toppnivån först; descend ett steg om gränserna ligger inbäddade."""
+    def score(candidate):
+        if not isinstance(candidate, dict):
+            return 0
+        return sum(1 for value in candidate.values() if has_util_field(value))
+
+    containers = [raw]
+    if score(raw) == 0:
+        for value in raw.values():
+            if score(value) > 0:
+                containers.append(value)
+    return containers
+
+
+def credit_fields(entry: dict):
+    fields = []
+    for key, value in entry.items():
+        if isinstance(value, (dict, list)):
+            continue
+        if key.lower() in ("resets_at", "reset_at"):
+            continue
+        fields.append(
+            {
+                "key": key,
+                "label": humanize_field(key),
+                "value": format_scalar(value),
+            }
+        )
+    return fields
+
+
+def format_scalar(value):
+    if isinstance(value, bool):
+        return "ja" if value else "nej"
+    if value is None:
+        return "–"
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        return ("%.2f" % value).rstrip("0").rstrip(".")
+    return str(value)
+
+
+def normalize(raw: dict, now: float):
+    """Rå JSON -> {limits, credits, unrecognized}. Generisk, inget hårdkodat."""
+    limits = []
+    credits = None
+    unrecognized = []
+    seen = set()
+
+    for container in limit_containers(raw):
+        if not isinstance(container, dict):
+            continue
+        for key, value in container.items():
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if not isinstance(value, dict):
+                if not isinstance(value, (list,)):
+                    unrecognized.append({"key": key, "reason": "skalärt värde"})
+                else:
+                    unrecognized.append({"key": key, "reason": "lista"})
+                continue
+
+            percent, util_field = pick_util(value)
+            resets_epoch, resets_raw = pick_reset(value)
+
+            if is_credit_key(key):
+                credits = {
+                    "key": key,
+                    "label": humanize_key(key),
+                    "percent": percent,
+                    "severity": severity(percent),
+                    "resets_at_epoch": resets_epoch,
+                    "resets_at": resets_raw,
+                    "resets_in_seconds": (
+                        None if resets_epoch is None else resets_epoch - now
+                    ),
+                    "fields": credit_fields(value),
+                }
+                continue
+
+            if not has_util_field(value):
+                unrecognized.append(
+                    {"key": key, "reason": "objekt utan utilization-fält"}
+                )
+                continue
+
+            window, suffix = parse_window(key)
+            limits.append(
+                {
+                    "key": key,
+                    "label": humanize_key(key),
+                    "known": key in KNOWN_LABELS,
+                    "percent": percent,
+                    "severity": severity(percent),
+                    "utilization_field": util_field,
+                    "window_seconds": window,
+                    "scope": suffix,
+                    "resets_at": resets_raw,
+                    "resets_at_epoch": resets_epoch,
+                    "resets_in_seconds": (
+                        None if resets_epoch is None else resets_epoch - now
+                    ),
+                }
+            )
+
+    limits.sort(
+        key=lambda item: (
+            0 if item["window_seconds"] is not None else 1,
+            item["window_seconds"] or 0,
+            0 if not item["scope"] else 1,
+            item["label"].casefold(),
+        )
+    )
+    return limits, credits, unrecognized
+
+
+# --------------------------------------------------------------------------
+# Datahämtning med cache
+# --------------------------------------------------------------------------
+
+
+def get_state(force: bool):
+    """-> (state, error|None, did_fetch).
+
+    Serverar alltid cachad data när nätet sviker. `did_fetch` säger om ett
+    riktigt nätverksanrop gjordes, så att `source` i payloaden blir sann i
+    stället för gissad utifrån cache-åldern.
+    """
+    now = time.time()
+    state = read_cache()
+    have_data = isinstance(state.get("raw"), dict)
+    fetched_at = state.get("fetched_at")
+    age = (now - fetched_at) if isinstance(fetched_at, (int, float)) else None
+
+    ttl = FORCE_MIN_INTERVAL if force else CACHE_TTL
+    if have_data and age is not None and 0 <= age < ttl:
+        return state, None, False
+
+    last_attempt = state.get("last_attempt_at")
+    if (
+        not force
+        and have_data
+        and state.get("last_error")
+        and isinstance(last_attempt, (int, float))
+        and 0 <= (now - last_attempt) < ERROR_BACKOFF
+    ):
+        # Backoff efter fel: hamra inte en endpoint som just sa nej.
+        error = state["last_error"]
+        return (
+            state,
+            UsageError(
+                error.get("kind", "unknown"),
+                error.get("message", "Okänt fel."),
+                error.get("retry_after"),
+            ),
+            False,
+        )
+
+    token = None
+    try:
+        token, expires_epoch = load_token()
+        if expires_epoch is not None and expires_epoch <= now:
+            # Servern är sanningen — försök ändå, filen kan vara nyss förnyad.
+            pass
+        raw = fetch_raw(token)
+    except UsageError as exc:
+        state["schema"] = SCHEMA
+        state["last_attempt_at"] = now
+        state["last_error"] = exc.as_dict()
+        write_cache(state)
+        return state, exc, True
+    finally:
+        token = None  # håll inte kvar token längre än nödvändigt
+
+    state = {
+        "schema": SCHEMA,
+        "raw": raw,
+        "fetched_at": now,
+        "last_attempt_at": now,
+        "last_error": None,
+    }
+    write_cache(state)
+    return state, None, True
+
+
+def build_payload(force: bool):
+    now = time.time()
+    state, error, did_fetch = get_state(force)
+
+    raw = state.get("raw") if isinstance(state.get("raw"), dict) else None
+    fetched_at = state.get("fetched_at")
+    age = (
+        (now - fetched_at) if isinstance(fetched_at, (int, float)) else None
+    )
+
+    limits, credits, unrecognized = ([], None, [])
+    if raw is not None:
+        limits, credits, unrecognized = normalize(raw, now)
+
+    percents = [
+        item["percent"] for item in limits if isinstance(item["percent"], (int, float))
+    ]
+    max_percent = max(percents) if percents else None
+
+    stale = bool(error) or (age is not None and age > STALE_AFTER)
+
+    payload = {
+        "schema": SCHEMA,
+        "ok": raw is not None,
+        "stale": stale,
+        # Ett misslyckat anrop räknas som cache — siffrorna kommer från cachen.
+        "source": "network" if (did_fetch and not error) else "cache",
+        "now": now,
+        "fetched_at": fetched_at,
+        "age_seconds": None if age is None else int(age),
+        "error": error.as_dict() if error else None,
+        "limits": limits,
+        "credits": credits,
+        "unrecognized": unrecognized,
+        "max_percent": max_percent,
+        "max_severity": severity(max_percent),
+        "endpoint_documented": False,
+    }
+    return payload, state
+
+
+# --------------------------------------------------------------------------
+# Textutdata
+# --------------------------------------------------------------------------
+
+
+def format_delta(seconds):
+    if seconds is None:
+        return None
+    if seconds <= 0:
+        return "nu"
+    total = int(seconds)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return "%d d %d h" % (days, hours)
+    if hours:
+        return "%d h %d min" % (hours, minutes)
+    if minutes:
+        return "%d min" % minutes
+    return "< 1 min"
+
+
+def format_age(seconds):
+    """Ålder på cachad data. Sekundupplösning under en minut."""
+    if seconds is None:
+        return "aldrig"
+    if seconds < 5:
+        return "just nu"
+    if seconds < 60:
+        return "%d s sedan" % int(seconds)
+    return "%s sedan" % format_delta(seconds)
+
+
+def format_percent(percent):
+    if percent is None:
+        return "–"
+    if abs(percent - round(percent)) < 0.05:
+        return "%d %%" % round(percent)
+    return "%.1f %%" % percent
+
+
+def text_bar(percent, width=20):
+    if percent is None:
+        return "·" * width
+    fraction = max(0.0, min(1.0, percent / 100.0))
+    filled = int(round(fraction * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def render_text(payload) -> str:
+    lines = []
+    error = payload.get("error")
+
+    header = "Claude usage"
+    if payload.get("ok"):
+        header += " · uppdaterad %s" % format_age(payload.get("age_seconds"))
+        if payload.get("stale"):
+            header += " · CACHAD"
+    lines.append(header)
+
+    if error:
+        message = error.get("message", "Okänt fel.")
+        # Lova bara cachad data när det faktiskt finns någon.
+        if payload.get("ok"):
+            message += " Visar cachad data."
+        lines.append("  ⚠ %s" % message)
+        if error.get("retry_after"):
+            lines.append("    Retry-After: %s" % error["retry_after"])
+
+    if not payload.get("ok"):
+        lines.append("  Ingen cachad data att visa heller.")
+        return "\n".join(lines)
+
+    limits = payload.get("limits") or []
+    credits = payload.get("credits")
+
+    rows = []
+    for limit in limits:
+        rows.append(
+            (
+                limit["label"] + ("" if limit["known"] else " *"),
+                format_percent(limit["percent"]),
+                text_bar(limit["percent"]),
+                format_delta(limit.get("resets_in_seconds")),
+            )
+        )
+
+    if not rows and not credits:
+        lines.append("  Svaret innehöll inga gränser.")
+
+    label_width = max([len(row[0]) for row in rows] or [0])
+    percent_width = max([len(row[1]) for row in rows] or [0])
+
+    for label, percent, bar, reset in rows:
+        line = "  %-*s  %*s  %s" % (
+            label_width, label, percent_width, percent, bar
+        )
+        if reset:
+            line += "  återställs %s" % ("nu" if reset == "nu" else "om " + reset)
+        lines.append(line)
+
+    if credits:
+        summary = " · ".join(
+            "%s: %s" % (field["label"], field["value"])
+            for field in credits.get("fields", [])
+        )
+        line = "  %-*s" % (label_width, credits["label"])
+        if credits.get("percent") is not None:
+            line += "  %*s  %s" % (
+                percent_width,
+                format_percent(credits["percent"]),
+                text_bar(credits["percent"]),
+            )
+        if summary:
+            line += "  " + summary
+        lines.append(line.rstrip())
+
+    if any(not limit["known"] for limit in limits):
+        lines.append("  * okänd nyckel — etiketten är autogenererad")
+
+    unrecognized = payload.get("unrecognized") or []
+    if unrecognized:
+        lines.append(
+            "  Ej tolkade nycklar: %s"
+            % ", ".join(
+                "%s (%s)" % (item["key"], item["reason"]) for item in unrecognized
+            )
+        )
+
+    lines.append("  Endpointen är odokumenterad och kan ändras utan förvarning.")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-usage",
+        description=(
+            "Visa användningsgränserna för din Claude-prenumeration. "
+            "Endpointen är odokumenterad och kan ändras utan förvarning."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--text",
+        action="store_const",
+        const="text",
+        dest="mode",
+        help="läsbar text (standard)",
+    )
+    mode.add_argument(
+        "--json",
+        action="store_const",
+        const="json",
+        dest="mode",
+        help="normaliserad JSON för tillägget",
+    )
+    mode.add_argument(
+        "--raw",
+        action="store_const",
+        const="raw",
+        dest="mode",
+        help="rå JSON precis som servern skickade den (discovery)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="gå förbi cachen (golv: %d s mellan anrop)" % int(FORCE_MIN_INTERVAL),
+    )
+    parser.set_defaults(mode="text")
+    args = parser.parse_args(argv)
+
+    try:
+        payload, state = build_payload(args.force)
+    except Exception as exc:  # pragma: no cover - sista skyddsnätet
+        message = scrub(exc)
+        if args.mode == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "ok": False,
+                        "stale": True,
+                        "error": {"kind": "internal_error", "message": message},
+                        "limits": [],
+                        "credits": None,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print("claude-usage: internt fel: %s" % message, file=sys.stderr)
+        return 1
+
+    if args.mode == "raw":
+        raw = state.get("raw")
+        note = []
+        if payload.get("error"):
+            note.append(payload["error"]["message"])
+        if payload.get("fetched_at"):
+            note.append("hämtad %s" % format_age(payload.get("age_seconds")))
+        if note:
+            # Metadata till stderr så att stdout förblir ren JSON för jq.
+            print("claude-usage: %s" % " · ".join(note), file=sys.stderr)
+        if raw is None:
+            print("claude-usage: ingen rå data att visa.", file=sys.stderr)
+            return 1
+        print(json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if args.mode == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload.get("ok") else 1
+
+    output = render_text(payload)
+    stream = sys.stdout if payload.get("ok") else sys.stderr
+    print(output, file=stream)
+    return 0 if payload.get("ok") else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:  # t.ex. `claude-usage --raw | head`
+        try:
+            sys.stdout.close()
+        finally:
+            sys.exit(0)

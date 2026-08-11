@@ -1,0 +1,114 @@
+/* Claude Usage — St stödjer bara en delmängd av CSS.
+ *
+ * Medvetna val:
+ *  - inga procentuella bredder (St räknar dem inte tillförlitligt) — staplarna
+ *    får sin bredd i px från extension.js, som är enda sanningen
+ *  - ingen `opacity` här (St läser den inte som CSS) — sätts som actor-opacity
+ *  - färgerna är GNOME-palettens blå/gul/röd och läsbara i både ljust och
+ *    mörkt tema; neutrala ytor är halvtransparent grått av samma skäl
+ */
+
+.claude-usage-panel-label {
+    padding-left: 4px;
+    font-feature-settings: "tnum";
+}
+
+/* Färgpricken i panelen */
+.claude-usage-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background-color: rgba(127, 127, 127, 0.55);
+}
+
+.claude-usage-dot.claude-usage-ok {
+    background-color: #3584e4;
+}
+
+.claude-usage-dot.claude-usage-warn {
+    background-color: #f5c211;
+}
+
+.claude-usage-dot.claude-usage-crit {
+    background-color: #e01b24;
+}
+
+.claude-usage-dot.claude-usage-error {
+    background-color: #77767b;
+    border: 1px solid #e01b24;
+}
+
+.claude-usage-dot.claude-usage-dot-stale {
+    border: 1px solid rgba(127, 127, 127, 0.9);
+}
+
+/* Popup-rader */
+.claude-usage-row-item {
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+
+.claude-usage-row {
+    spacing: 4px;
+}
+
+.claude-usage-row-label {
+    font-weight: bold;
+}
+
+.claude-usage-row-percent {
+    padding-left: 12px;
+    font-feature-settings: "tnum";
+}
+
+.claude-usage-row-percent.claude-usage-warn {
+    color: #f5c211;
+}
+
+.claude-usage-row-percent.claude-usage-crit {
+    color: #e01b24;
+}
+
+.claude-usage-row-reset {
+    font-size: 0.85em;
+    color: rgba(146, 149, 149, 1);
+}
+
+/* Stapel: spåret får sin bredd inline från extension.js */
+.claude-usage-bar-track {
+    height: 8px;
+    border-radius: 4px;
+    background-color: rgba(127, 127, 127, 0.3);
+}
+
+.claude-usage-bar-fill {
+    border-radius: 4px;
+    background-color: #3584e4;
+}
+
+.claude-usage-bar-fill.claude-usage-warn {
+    background-color: #f5c211;
+}
+
+.claude-usage-bar-fill.claude-usage-crit {
+    background-color: #e01b24;
+}
+
+.claude-usage-bar-fill.claude-usage-unknown {
+    background-color: rgba(127, 127, 127, 0.55);
+}
+
+/* Status- och notrader */
+.claude-usage-info-item {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.claude-usage-status {
+    font-size: 0.9em;
+}
+
+.claude-usage-note {
+    font-size: 0.8em;
+    color: rgba(146, 149, 149, 1);
+}
