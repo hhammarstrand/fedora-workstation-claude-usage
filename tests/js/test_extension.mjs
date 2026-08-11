@@ -207,8 +207,10 @@ test('färgtrösklarna följer utilization: blå < 70, gul 70–89, röd >= 90',
 
 test('cachad data dimmas i panelen', async () => {
     const indicator = await build(payload({stale: true, age_seconds: 900}));
-    assert.equal(indicator._panelLabel.opacity, 150);
+    assert.equal(indicator._panelLabel.opacity, 145);
+    assert.equal(indicator._dot.opacity, 145, 'pricken dimmas också');
     assert.match(indicator._dot.style_class, /claude-usage-dot-stale/);
+    // Prickens storlek får inte bero på om datan är färsk — inga ramar i CSS.
     indicator.destroy();
 });
 
@@ -430,7 +432,8 @@ test('ett fel efter lyckad hämtning behåller de senaste siffrorna', async () =
     assert.equal(indicator._panelLabel.text, '94 %', 'gamla siffror ska kvarstå');
     assert.ok(menuTexts(indicator).some(text => text.includes('skriptet försvann')));
     // ...men de ska märkas som gamla, trots att svaret sa stale: false.
-    assert.equal(indicator._panelLabel.opacity, 150);
+    assert.equal(indicator._panelLabel.opacity, 145);
+    assert.equal(indicator._dot.opacity, 145);
     assert.match(indicator._dot.style_class, /claude-usage-dot-stale/);
     indicator.destroy();
 });
@@ -509,6 +512,8 @@ test('Uppdatera nu forcerar förbi cachen', async () => {
     const indicator = await build();
     const refreshItem = indicator.menu.items.at(-1);
     assert.equal(refreshItem.text, 'Uppdatera nu');
+    // Ikonpost med symbolisk ikon, som GNOME:s egna menyval.
+    assert.equal(refreshItem.iconName, 'view-refresh-symbolic');
 
     refreshItem.activate();
     await flush();
@@ -603,7 +608,10 @@ test('enable() lägger indikatorn i panelen och disable() tar bort den', async (
 
     const {Main} = await import('./stubs.mjs');
     assert.ok(Main.panel.statusArea['claude-usage@test'], 'ska ha lagts till i panelen');
-    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'right');
+    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'center',
+        'ska ligga i panelens mittbox, intill klockan');
+    assert.equal(Main.panel.statusArea['claude-usage@test'].position, 1,
+        'position 1 = direkt till höger om klockan');
     assert.equal(state.timers.size, 2);
 
     extension.disable();

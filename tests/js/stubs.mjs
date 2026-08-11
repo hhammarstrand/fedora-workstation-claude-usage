@@ -332,6 +332,13 @@ class PopupMenuItemStub extends PopupBaseMenuItemStub {
     }
 }
 
+class PopupImageMenuItemStub extends PopupMenuItemStub {
+    constructor(text, iconName, params = {}) {
+        super(text, params);
+        this.iconName = iconName;
+    }
+}
+
 class PopupSeparatorMenuItemStub extends Actor {
     constructor() {
         super();
@@ -342,6 +349,7 @@ class PopupSeparatorMenuItemStub extends Actor {
 export const PopupMenu = {
     PopupBaseMenuItem: PopupBaseMenuItemStub,
     PopupMenuItem: PopupMenuItemStub,
+    PopupImageMenuItem: PopupImageMenuItemStub,
     PopupSeparatorMenuItem: PopupSeparatorMenuItemStub,
 };
 

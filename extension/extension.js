@@ -27,6 +27,18 @@ const SUBPROCESS_TIMEOUT = 20;
 const BAR_WIDTH = 220;
 const MENU_MAX_WIDTH = BAR_WIDTH + 110;
 
+/* Panelens mittbox innehåller klockan (dateMenu). Position 1 lägger oss
+ * direkt till höger om den; 0 skulle lägga oss till vänster. Hela klustret
+ * fortsätter vara centrerat i panelen, så klockan flyttar sig något åt vänster.
+ * Byt till 'right' för statusområdet längst till höger. */
+const PANEL_BOX = 'center';
+const PANEL_POSITION = 1;
+
+/* Adwaita dimmar sekundärtext till drygt halv opacitet. Vi sätter den på
+ * actorn i stället för i CSS: St läser inte opacity från stilmallen, och en
+ * hårdkodad grå färg skulle se fel ut i antingen ljust eller mörkt tema. */
+const DIM_OPACITY = 145;
+
 const SEVERITY_CLASS = {
     ok: 'claude-usage-ok',
     warn: 'claude-usage-warn',
@@ -122,6 +134,15 @@ function wrappingLabel(text, styleClass) {
     return label;
 }
 
+/** Sekundärtext: temats färg, nedtonad — som Adwaitas dim-label. */
+function dimLabel(text, styleClass, wrap = false) {
+    const label = wrap
+        ? wrappingLabel(text, styleClass)
+        : new St.Label({text, style_class: styleClass});
+    label.opacity = DIM_OPACITY;
+    return label;
+}
+
 const ClaudeUsageIndicator = GObject.registerClass(
 class ClaudeUsageIndicator extends PanelMenu.Button {
     _init(scriptPath) {
@@ -139,7 +160,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._menuSignalId = 0;
         this._disposed = false;
 
-        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        // panel-status-menu-box ger GNOME:s egna mått; vår klass bara mellanrummet.
+        const box = new St.BoxLayout({
+            style_class: 'panel-status-menu-box claude-usage-panel-box',
+        });
         this._dot = new St.Widget({
             style_class: 'claude-usage-dot claude-usage-unknown',
             y_align: Clutter.ActorAlign.CENTER,
@@ -327,8 +351,11 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         this._panelLabel.text = text;
         this._dot.style_class = `claude-usage-dot ${dotClass}`;
-        // Dimma siffran när den inte är färsk.
-        this._panelLabel.opacity = showingStale ? 150 : 255;
+        // Dimma prick och siffra när datan inte är färsk. Opacitet i stället för
+        // en annan prickstil, så att inget hoppar i storlek i panelen.
+        const opacity = showingStale ? DIM_OPACITY : 255;
+        this._panelLabel.opacity = opacity;
+        this._dot.opacity = opacity;
     }
 
     _statusLines() {
@@ -365,7 +392,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             can_focus: false,
             style_class: 'claude-usage-info-item',
         });
-        const label = wrappingLabel(text, styleClass);
+        const label = dimLabel(text, styleClass, true);
         label.style = `max-width: ${MENU_MAX_WIDTH}px;`;
         item.add_child(label);
         return item;
@@ -385,9 +412,12 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             x_expand: true,
             style_class: 'claude-usage-row-label',
         });
+        // Procentsiffran behåller temats textfärg. Severiteten bärs av stapeln
+        // och panelprickens färg, vilket både är mer Adwaita-återhållsamt och
+        // undviker kontrastproblem mot okänd popup-bakgrund.
         const percent = new St.Label({
             text: formatPercent(limit.percent),
-            style_class: `claude-usage-row-percent ${severityClass(limit.severity)}`,
+            style_class: 'claude-usage-row-percent',
         });
         heading.add_child(name);
         heading.add_child(percent);
@@ -404,10 +434,8 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         });
         track.add_child(fill);
 
-        const footer = new St.Label({
-            text: this._resetText(limit.resets_at_epoch),
-            style_class: 'claude-usage-row-reset',
-        });
+        const footer = dimLabel(
+            this._resetText(limit.resets_at_epoch), 'claude-usage-row-reset');
 
         column.add_child(heading);
         column.add_child(track);
@@ -455,7 +483,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         if (typeof credits.percent === 'number') {
             heading.add_child(new St.Label({
                 text: formatPercent(credits.percent),
-                style_class: `claude-usage-row-percent ${severityClass(credits.severity)}`,
+                style_class: 'claude-usage-row-percent',
             }));
         }
         column.add_child(heading);
@@ -464,7 +492,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             .map(field => `${field.label}: ${field.value}`)
             .join(' · ');
         if (summary) {
-            const label = wrappingLabel(summary, 'claude-usage-row-reset');
+            const label = dimLabel(summary, 'claude-usage-row-reset', true);
             label.style = `max-width: ${MENU_MAX_WIDTH}px;`;
             column.add_child(label);
         }
@@ -515,7 +543,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         }
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const refreshItem = new PopupMenu.PopupMenuItem('Uppdatera nu');
+        // Ikonpost, som GNOME:s egna menyval.
+        const refreshItem = new PopupMenu.PopupImageMenuItem(
+            'Uppdatera nu', 'view-refresh-symbolic');
         refreshItem.connect('activate', () => this._refresh(true));
         this.menu.addMenuItem(refreshItem);
     }
@@ -538,7 +568,8 @@ export default class ClaudeUsageExtension extends Extension {
     enable() {
         const indicator = new ClaudeUsageIndicator(resolveScriptPath());
         try {
-            Main.panel.addToStatusArea(this.uuid, indicator, 0, 'right');
+            Main.panel.addToStatusArea(
+                this.uuid, indicator, PANEL_POSITION, PANEL_BOX);
         } catch (error) {
             // Lämna inte en indikator med levande timers bakom oss om rollen
             // redan är tagen (kan hända vid snabb disable/enable).

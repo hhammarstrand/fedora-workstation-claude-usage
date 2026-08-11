@@ -29,6 +29,7 @@ const RESOURCE_MODULES = {
         `import {PopupMenu} from ${JSON.stringify(STUBS)};
          export const PopupBaseMenuItem = PopupMenu.PopupBaseMenuItem;
          export const PopupMenuItem = PopupMenu.PopupMenuItem;
+         export const PopupImageMenuItem = PopupMenu.PopupImageMenuItem;
          export const PopupSeparatorMenuItem = PopupMenu.PopupSeparatorMenuItem;`,
     'resource:///org/gnome/shell/extensions/extension.js':
         `export {Extension} from ${JSON.stringify(STUBS)};

@@ -4,9 +4,16 @@ Visar din Claude-prenumerations användningsgränser i GNOME:s toppanel — samm
 siffror som Usage-vyn i Claude-appen: sessionsgränsen (5 h), veckogränsen för
 alla modeller, eventuella modellspecifika veckogränser, och credits.
 
-Panelknappen visar den högsta aktuella procenten och en färgprick (blå under
-70 %, gul från 70 %, röd från 90 %). Popupen ger en rad per gräns med etikett,
-procent, en stapel och nedräkning till nästa återställning. Credits ligger sist.
+Indikatorn sitter i panelens mittbox, **direkt till höger om klockan**.
+Den visar den högsta aktuella procenten och en färgprick (blå under 70 %, gul
+från 70 %, röd från 90 %). Popupen ger en rad per gräns med etikett, procent, en
+stapel och nedräkning till nästa återställning. Credits ligger sist.
+
+Vill du flytta den byter du `PANEL_BOX` och `PANEL_POSITION` högst upp i
+`extension/extension.js`: `PANEL_POSITION = 0` lägger den till vänster om
+klockan, och `PANEL_BOX = 'right'` flyttar den till statusområdet längst till
+höger. Eftersom mittboxen är centrerad i panelen flyttar klockan sig något åt
+vänster när indikatorn läggs till — hela klustret fortsätter vara centrerat.
 
 > [!WARNING]
 > **Datakällan är odokumenterad.** Siffrorna hämtas från
@@ -75,6 +82,35 @@ gnome-extensions enable $UUID
 # logga ut och in igen
 ```
 </details>
+
+## Grafiken
+
+Stilen följer Adwaita, så att det inte ser ut som ett påklistrat tillägg:
+
+- **Typsnitt och textfärg ärvs från temat.** Ingen `font-size` på panelknappen,
+  så siffran matchar klockan exakt, och ingen `color` på primärtext.
+- **Sekundärtext dimmas med actor-opacitet**, inte med en hårdkodad grå färg.
+  En fast grå ser fel ut i antingen ljust eller mörkt tema; opacitet fungerar i
+  båda. (St läser dessutom inte `opacity` från stilmallen.)
+- **Popup-raderna behåller GNOME:s egna `popup-menu-item`-mått.** Klasserna i
+  `stylesheet.css` läggs till, de ersätter inget.
+- **Färger ur GNOME/libadwaitas palett:** accentblå `#3584e4` (Fedora
+  Workstations standardaccent), varning `#e5a50a`, fel `#e01b24`. Alla tre är
+  läsbara mot både ljus och mörk popup-bakgrund.
+- **Procentsiffran är aldrig färgad.** Severiteten bärs av stapeln och
+  panelprickens färg — mer återhållsamt, och utan kontrastrisk mot en
+  bakgrund vi inte känner.
+- **Cachad data uttrycks med opacitet**, inte med en annan prickstil. St lägger
+  `border` utanför `width`/`height`, så en ihålig prick skulle byta storlek varje
+  gång datan blev gammal och panelen hade hoppat.
+- **"Uppdatera nu" är en ikonpost** (`view-refresh-symbolic`), som GNOME:s egna
+  menyval.
+
+Har du ändrat accentfärg i GNOME-inställningarna och vill att staplarna följer
+den, lägg till `background-color: -st-accent-color;` som en extra rad efter
+`#3584e4` i `stylesheet.css`. Fallbacket ligger först, så en Shell-version som
+inte känner igen egenskapen behåller blått. Jag har inte kunnat verifiera den
+egenskapen mot en riktig Shell, därför är den inte påslagen från början.
 
 ## Discovery: kolla den råa JSON:en först
 
