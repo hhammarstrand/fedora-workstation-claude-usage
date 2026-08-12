@@ -527,6 +527,83 @@ def limit_containers(raw: dict):
     return containers
 
 
+#: Fältnamn som kan bära nyckeln för en gräns som ligger i en lista.
+LIST_KEY_FIELDS = (
+    "type", "limit_type", "key", "name", "id", "window", "scope", "period",
+)
+
+
+def list_entries(container_key: str, items):
+    """Plocka ut gränser ur en lista, t.ex. {"limits": [{...}, {...}]}.
+
+    Riktiga svar lägger de modellspecifika veckogränserna i en lista i stället
+    för som toppnycklar, så listor får inte ignoreras. Nyckeln hämtas från
+    första strängfältet som kan tänkas namnge posten; annars index.
+    """
+    found = []
+    for index, item in enumerate(items):
+        if not has_util_field(item):
+            continue
+        key = None
+        for field in LIST_KEY_FIELDS:
+            candidate = item.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                key = candidate.strip()
+                break
+        if key is None:
+            key = "%s_%d" % (container_key, index)
+        found.append((key, item))
+    return found
+
+
+def preview_scalar(value, width=40):
+    """Kort förhandsvisning av ett otolkat värde, så att discovery blir enkel."""
+    if isinstance(value, (dict, list)):
+        return "%s med %d poster" % (
+            "objekt" if isinstance(value, dict) else "lista", len(value)
+        )
+    text = format_scalar(value)
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+#: Fält som är värda att visa i credits-raden, i den ordningen. Riktiga svar
+#: innehåller ett dussin fält — currency, decimal_places, disabled_reason,
+#: credits_ever_enabled … — och alla på en rad blir en oläslig vägg. Allt finns
+#: kvar i `fields` och i --raw; det här styr bara vad som visas.
+CREDIT_DISPLAY_PRIORITY = (
+    "used_credits",
+    "used",
+    "monthly_limit",
+    "limit",
+    "currency",
+    "disabled_reason",
+    "is_enabled",
+    "enabled",
+)
+#: utilization utesluts medvetet — den visas redan som procent i egen kolumn.
+CREDIT_DISPLAY_SKIP = ("utilization", "utilisation", "percent")
+MAX_CREDIT_DISPLAY_FIELDS = 4
+
+
+def display_credit_fields(fields):
+    """Välj ut de intressanta credits-fälten, i prioritetsordning."""
+    by_key = {
+        field["key"]: field
+        for field in fields
+        if field["key"] not in CREDIT_DISPLAY_SKIP
+    }
+    chosen = []
+    for key in CREDIT_DISPLAY_PRIORITY:
+        if key in by_key:
+            chosen.append(by_key[key])
+        if len(chosen) >= MAX_CREDIT_DISPLAY_FIELDS:
+            return chosen
+    if chosen:
+        return chosen
+    # Ingen känd nyckel: visa de första fälten så att något syns.
+    return list(by_key.values())[:MAX_CREDIT_DISPLAY_FIELDS]
+
+
 def credit_fields(entry: dict):
     fields = []
     for key, value in entry.items():
@@ -556,12 +633,57 @@ def format_scalar(value):
     return str(value)
 
 
+def build_limit(key: str, value: dict, now: float):
+    """Ett gränsobjekt -> normaliserad post. Används för både toppnycklar och
+    poster som låg i en lista."""
+    percent, util_field = pick_util(value)
+    resets_epoch, resets_raw = pick_reset(value)
+    window, suffix = parse_window(key)
+    return {
+        "key": key,
+        "label": humanize_key(key),
+        "known": key in KNOWN_LABELS,
+        "percent": percent,
+        "severity": severity(percent),
+        "utilization_field": util_field,
+        "window_seconds": window,
+        "scope": suffix,
+        "resets_at": resets_raw,
+        "resets_at_epoch": resets_epoch,
+        "resets_in_seconds": None if resets_epoch is None else resets_epoch - now,
+    }
+
+
+def build_credits(key: str, value: dict, now: float):
+    percent, _ = pick_util(value)
+    resets_epoch, resets_raw = pick_reset(value)
+    fields = credit_fields(value)
+    return {
+        "key": key,
+        "label": humanize_key(key),
+        "percent": percent,
+        "severity": severity(percent),
+        "resets_at_epoch": resets_epoch,
+        "resets_at": resets_raw,
+        "resets_in_seconds": None if resets_epoch is None else resets_epoch - now,
+        "fields": fields,
+        "display_fields": display_credit_fields(fields),
+    }
+
+
 def normalize(raw: dict, now: float):
-    """Rå JSON -> {limits, credits, unrecognized}. Generisk, inget hårdkodat."""
+    """Rå JSON -> {limits, credits, unrecognized}. Generisk, inget hårdkodat.
+
+    Ordningen spelar roll: toppnycklar först, sedan listor. En gräns som ligger
+    i en lista får därför komplettera en toppnyckel som bara var en skalär —
+    vilket är exakt formen riktiga svar har för de modellspecifika
+    veckogränserna.
+    """
     limits = []
     credits = None
-    unrecognized = []
+    unrecognized = {}
     seen = set()
+    pending_lists = []
 
     for container in limit_containers(raw):
         if not isinstance(container, dict):
@@ -571,55 +693,56 @@ def normalize(raw: dict, now: float):
                 continue
             seen.add(key)
 
-            if not isinstance(value, dict):
-                if not isinstance(value, (list,)):
-                    unrecognized.append({"key": key, "reason": "skalärt värde"})
-                else:
-                    unrecognized.append({"key": key, "reason": "lista"})
+            if isinstance(value, list):
+                # Kan innehålla gränser — avgörs efter att toppnivån är klar.
+                pending_lists.append((key, value))
                 continue
 
-            percent, util_field = pick_util(value)
-            resets_epoch, resets_raw = pick_reset(value)
+            if not isinstance(value, dict):
+                unrecognized[key] = {
+                    "key": key,
+                    "reason": "skalärt värde",
+                    "value": preview_scalar(value),
+                }
+                continue
 
             if is_credit_key(key):
-                credits = {
-                    "key": key,
-                    "label": humanize_key(key),
-                    "percent": percent,
-                    "severity": severity(percent),
-                    "resets_at_epoch": resets_epoch,
-                    "resets_at": resets_raw,
-                    "resets_in_seconds": (
-                        None if resets_epoch is None else resets_epoch - now
-                    ),
-                    "fields": credit_fields(value),
-                }
+                credits = build_credits(key, value, now)
                 continue
 
             if not has_util_field(value):
-                unrecognized.append(
-                    {"key": key, "reason": "objekt utan utilization-fält"}
-                )
+                unrecognized[key] = {
+                    "key": key,
+                    "reason": "objekt utan utilization-fält",
+                    "value": preview_scalar(value),
+                }
                 continue
 
-            window, suffix = parse_window(key)
-            limits.append(
-                {
-                    "key": key,
-                    "label": humanize_key(key),
-                    "known": key in KNOWN_LABELS,
-                    "percent": percent,
-                    "severity": severity(percent),
-                    "utilization_field": util_field,
-                    "window_seconds": window,
-                    "scope": suffix,
-                    "resets_at": resets_raw,
-                    "resets_at_epoch": resets_epoch,
-                    "resets_in_seconds": (
-                        None if resets_epoch is None else resets_epoch - now
-                    ),
-                }
-            )
+            limits.append(build_limit(key, value, now))
+
+    # Listor: plocka ut det som ser ut som gränser. En post härifrån får ersätta
+    # en toppnyckel som bara var en otolkbar skalär.
+    have = {item["key"] for item in limits}
+    for container_key, items in pending_lists:
+        extracted = list_entries(container_key, items)
+        for key, item in extracted:
+            if key in have:
+                continue
+            if is_credit_key(key):
+                if credits is None:
+                    credits = build_credits(key, item, now)
+                continue
+            limits.append(build_limit(key, item, now))
+            have.add(key)
+            unrecognized.pop(key, None)
+        if extracted:
+            unrecognized.pop(container_key, None)
+        else:
+            unrecognized[container_key] = {
+                "key": container_key,
+                "reason": "lista utan gränser",
+                "value": preview_scalar(items),
+            }
 
     limits.sort(
         key=lambda item: (
@@ -629,7 +752,7 @@ def normalize(raw: dict, now: float):
             item["label"].casefold(),
         )
     )
-    return limits, credits, unrecognized
+    return limits, credits, sorted(unrecognized.values(), key=lambda e: e["key"])
 
 
 # --------------------------------------------------------------------------
@@ -847,7 +970,7 @@ def render_text(payload) -> str:
     if credits:
         summary = " · ".join(
             "%s: %s" % (field["label"], field["value"])
-            for field in credits.get("fields", [])
+            for field in (credits.get("display_fields") or credits.get("fields", []))
         )
         line = "  %-*s" % (label_width, credits["label"])
         if credits.get("percent") is not None:
@@ -856,21 +979,30 @@ def render_text(payload) -> str:
                 format_percent(credits["percent"]),
                 text_bar(credits["percent"]),
             )
-        if summary:
-            line += "  " + summary
         lines.append(line.rstrip())
+        # Fälten på egen rad — samma upplägg som popupen, och håller radlängden
+        # nere även när credits-objektet har ett dussin fält.
+        if summary:
+            lines.append("    " + summary)
 
     if any(not limit["known"] for limit in limits):
         lines.append("  * okänd nyckel — etiketten är autogenererad")
 
     unrecognized = payload.get("unrecognized") or []
     if unrecognized:
-        lines.append(
-            "  Ej tolkade nycklar: %s"
-            % ", ".join(
-                "%s (%s)" % (item["key"], item["reason"]) for item in unrecognized
+        lines.append("  Ej tolkade nycklar:")
+        width = max(len(item["key"]) for item in unrecognized)
+        for item in unrecognized:
+            detail = item.get("value")
+            lines.append(
+                "    %-*s  %s%s"
+                % (
+                    width,
+                    item["key"],
+                    item["reason"],
+                    "" if detail in (None, "") else ": %s" % detail,
+                )
             )
-        )
 
     lines.append("  Endpointen är odokumenterad och kan ändras utan förvarning.")
     return "\n".join(lines)

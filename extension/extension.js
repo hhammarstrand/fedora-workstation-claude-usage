@@ -488,7 +488,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         }
         column.add_child(heading);
 
-        const summary = (credits.fields ?? [])
+        // display_fields är den kurerade delmängden; riktiga svar har ett dussin
+        // fält och alla på en rad blir en oläslig vägg.
+        const summary = (credits.display_fields ?? credits.fields ?? [])
             .map(field => `${field.label}: ${field.value}`)
             .join(' · ');
         if (summary) {

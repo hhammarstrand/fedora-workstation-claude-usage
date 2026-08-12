@@ -107,7 +107,7 @@ tools/
   diagnose.sh               Samlar allt om varför tillägget inte syns.
 tests/
   run.sh                    Kör allt.
-  test_claude_usage.py      44 tester mot CLI:t via en lokal stubbserver.
+  test_claude_usage.py      53 tester mot CLI:t via en lokal stubbserver.
   js/
     test_extension.mjs      36 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
@@ -234,8 +234,9 @@ Parsern itererar över alla toppnycklar och klassar varje värde:
 | --- | --- |
 | Objekt med ett `utilization`-fält | **Gräns** — egen rad med stapel |
 | Nyckeln är `extra_usage` eller innehåller `credit` | **Credits** — renderas sist |
-| Objekt utan `utilization` | **Ej tolkad** — listas i popupen, tappas inte |
-| Skalärt värde eller lista | **Ej tolkad** — listas i popupen |
+| Lista med objekt som har `utilization` | **Gränser** — en rad per post |
+| Objekt utan `utilization` | **Ej tolkad** — listas i popupen med sitt värde |
+| Skalärt värde | **Ej tolkad** — listas i popupen med sitt värde |
 
 Som `utilization` accepteras, i den ordningen: `utilization`, `utilisation`,
 `utilization_percent`, `percent_used`, `percent`. Värdet får vara heltal,
@@ -243,6 +244,35 @@ decimaltal eller sträng (`"42"`, `"42%"`, `"42,5"`).
 
 Hittas inga gränser på toppnivån letar parsern **ett** steg djupare, så att ett
 svar som `{"usage": {"five_hour": …}}` också fungerar.
+
+### Gränser som ligger i en lista
+
+Riktiga svar lägger inte de modellspecifika veckogränserna som toppnycklar. Där
+är `seven_day_opus` och liknande **skalärer**, och de faktiska gränserna ligger i
+en lista:
+
+```json
+{
+  "five_hour":      { "utilization": 78, "resets_at": "…" },
+  "seven_day":      { "utilization": 28, "resets_at": "…" },
+  "seven_day_opus": 0,
+  "limits": [
+    { "type": "seven_day_opus",   "utilization": 12, "resets_at": "…" },
+    { "type": "seven_day_sonnet", "utilization": 41, "resets_at": "…" }
+  ]
+}
+```
+
+Därför gås listor igenom också. Varje post som har ett `utilization`-fält blir en
+gräns, och nyckeln hämtas från första strängfältet som kan namnge posten:
+`type`, `limit_type`, `key`, `name`, `id`, `window`, `scope`, `period`. Saknas
+alla blir nyckeln `listnamn_index`, så posten renderas ändå.
+
+Ordningen är avsiktlig: **toppnycklar först, listor sedan.** En gräns ur listan
+får komplettera en toppnyckel som bara var en skalär, utan att det blir
+dubbletter — skalären försvinner då ur "ej tolkade nycklar". En lista som inte
+innehåller några gränser rapporteras som `lista utan gränser` i stället för att
+tigande försvinna.
 
 ### Ordning
 
@@ -362,7 +392,7 @@ tillägget. `schema` räknas upp om formen bryts.
 | `error` | objekt \| null | Se nedan |
 | `limits` | lista | En post per gräns, sorterad |
 | `credits` | objekt \| null | Credits-raden |
-| `unrecognized` | lista | `{key, reason}` för nycklar som inte tolkades |
+| `unrecognized` | lista | `{key, reason, value}` för nycklar som inte tolkades |
 | `max_percent` | float \| null | Högsta procenten bland gränserna |
 | `max_severity` | sträng | `ok`, `warn`, `crit` eller `unknown` |
 | `endpoint_documented` | bool | Alltid `false`. En påminnelse. |
@@ -388,9 +418,19 @@ Tillägget räknar nedräkningen från `resets_at_epoch` lokalt, inte från
 
 ### `credits`
 
-Samma fält som en gräns, plus `fields`: en lista av `{key, label, value}` för
-varje skalärt fält i objektet. Formen på `extra_usage` är okänd, så allt
-renderas generiskt som `Etikett: värde`.
+Samma fält som en gräns, plus två listor av `{key, label, value}`:
+
+| Fält | Innehåll |
+| --- | --- |
+| `fields` | **Alla** skalära fält i objektet, orört |
+| `display_fields` | Den kurerade delmängden som visas — högst 4 |
+
+Riktiga svar har ett dussin fält (`currency`, `decimal_places`,
+`disabled_reason`, `credits_ever_enabled`, `spend_limit_reached` …). Alla på en
+rad blir en oläslig vägg, så `display_fields` väljer i prioritetsordning:
+`used_credits`, `monthly_limit`, `currency`, `disabled_reason`, `is_enabled`.
+`utilization` utesluts medvetet — den visas redan som procent i egen kolumn.
+Allt finns kvar i `fields` och i `--raw`.
 
 ### `error.kind`
 
@@ -653,13 +693,15 @@ claude-usage --force --text
 
 Ärligt redovisat, inklusive det som inte gått att verifiera:
 
-- **`utilization` antas vara 0–100, inte 0–1.** Det är den publikt rapporterade
-  formen, men det har inte bekräftats mot ett riktigt svar. Visar panelen `0 %`
-  eller `1 %` när Claude-appen visar mer, är det här förklaringen — kör
-  `claude-usage --raw` och hör av dig.
-- **Formen på `extra_usage` är okänd.** Credits renderas generiskt som
-  `Etikett: värde` för varje skalärt fält. Fungerar, men blir inte lika snyggt
-  som en skräddarsydd rad.
+- **Beloppen i credits visas orörda.** Ett riktigt svar innehåller
+  `monthly_limit: 8500` tillsammans med `currency: EUR` och `decimal_places: 2`,
+  vilket sannolikt betyder 85,00 €. Skriptet räknar inte om det, eftersom en
+  felaktig omräkning med faktor 100 är värre än ett rått tal. Jämför med
+  Claude-appens Usage-vy.
+- **Nycklar som bara är interna kodnamn visas också.** Ett riktigt svar innehåller
+  objekt som `nimbus_quill` och `spend` med `utilization: 0`. De renderas med
+  autogenererad etikett och `*`, eftersom specen säger att inget får tappas — men
+  de är brus. Vill du dölja dem, filtrera på nyckel i `normalize()`.
 - **Grafiken är inte sedd på en körande GNOME.** Mått och färger är valda utifrån
   Adwaitas palett och St:s begränsningar, inte utifrån en skärmdump.
 - **`-st-accent-color` är inte verifierad** och därför inte påslagen. Standardblå
@@ -679,7 +721,7 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (44 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (53 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,

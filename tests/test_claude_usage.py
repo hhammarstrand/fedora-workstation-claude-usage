@@ -363,6 +363,172 @@ class TestHappyPath(UsageTestCase):
         self.assertEqual(json.loads(result.stdout), SAMPLE)
 
 
+class TestRealWorldShape(UsageTestCase):
+    """Formen ett riktigt konto faktiskt returnerar (GNOME 50, aug 2026).
+
+    Skiljer sig från den publikt rapporterade: de modellspecifika
+    veckogränserna är skalärer på toppnivån och de riktiga gränserna ligger i
+    en lista under `limits`. Credits har ett dussin fält.
+    """
+
+    SHAPE = {
+        "five_hour": {"utilization": 66, "resets_at": "2026-08-12T22:00:00Z"},
+        "seven_day": {"utilization": 27, "resets_at": "2026-08-19T05:00:00Z"},
+        # Skalärer, inte objekt — de här tappades tidigare helt.
+        "seven_day_opus": 0,
+        "seven_day_sonnet": 0,
+        "seven_day_cowork": 0,
+        "seven_day_oauth_apps": 0,
+        "member_dashboard_available": True,
+        # De riktiga modellspecifika gränserna, i en lista.
+        "limits": [
+            {
+                "type": "seven_day_opus",
+                "utilization": 12,
+                "resets_at": "2026-08-19T05:00:00Z",
+            },
+            {
+                "type": "seven_day_sonnet",
+                "utilization": 41,
+                "resets_at": "2026-08-19T05:00:00Z",
+            },
+        ],
+        "nimbus_quill": {"utilization": 0},
+        "extra_usage": {
+            "is_enabled": False,
+            "monthly_limit": 8500,
+            "used_credits": 0,
+            "utilization": 0,
+            "currency": "EUR",
+            "decimal_places": 2,
+            "disabled_reason": "out_of_credits",
+            "user_disabled": False,
+            "spend_limit_reached": False,
+            "credits_ever_enabled": True,
+            "daily": None,
+            "weekly": None,
+        },
+    }
+
+    def serve_shape(self):
+        self.serve(lambda n: (200, "application/json", json.dumps(self.SHAPE)))
+
+    def test_limits_inside_a_list_are_extracted(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+
+        self.assertIn("seven_day_opus", by_key, "gränser i en lista får inte tappas")
+        self.assertIn("seven_day_sonnet", by_key)
+        self.assertAlmostEqual(by_key["seven_day_opus"]["percent"], 12.0)
+        self.assertAlmostEqual(by_key["seven_day_sonnet"]["percent"], 41.0)
+        # Etiketten hämtas från type-fältet, så den blir den kända.
+        self.assertEqual(by_key["seven_day_opus"]["label"], "Vecka – Opus")
+        self.assertTrue(by_key["seven_day_opus"]["known"])
+        self.assertIsNotNone(by_key["seven_day_opus"]["resets_at_epoch"])
+
+    def test_list_derived_limits_sort_with_the_rest(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        keys = [limit["key"] for limit in payload["limits"]]
+        self.assertEqual(keys[0], "five_hour")
+        self.assertEqual(keys[1], "seven_day")
+        # Modellspecifika efter den generella veckogränsen.
+        self.assertLess(keys.index("seven_day"), keys.index("seven_day_opus"))
+        self.assertLess(keys.index("seven_day"), keys.index("seven_day_sonnet"))
+
+    def test_scalar_shadow_keys_do_not_block_the_list_entries(self):
+        """seven_day_opus finns både som skalär och i listan — listan vinner."""
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        keys = [limit["key"] for limit in payload["limits"]]
+        self.assertEqual(keys.count("seven_day_opus"), 1, "ingen dubblett")
+        unrecognized = {item["key"] for item in payload["unrecognized"]}
+        self.assertNotIn("seven_day_opus", unrecognized, "ska inte stå som otolkad")
+        self.assertNotIn("limits", unrecognized, "listan tolkades ju")
+
+    def test_remaining_scalars_are_reported_with_their_value(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        by_key = {item["key"]: item for item in payload["unrecognized"]}
+        # Kvar som otolkade: de skalärer som inte fanns i listan.
+        self.assertIn("seven_day_cowork", by_key)
+        self.assertEqual(by_key["seven_day_cowork"]["value"], "0")
+        self.assertIn("member_dashboard_available", by_key)
+        self.assertEqual(by_key["member_dashboard_available"]["value"], "ja")
+
+    def test_credits_display_fields_are_curated(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        credits = payload["credits"]
+
+        # Alla fält finns kvar för den som vill åt dem.
+        all_keys = {field["key"] for field in credits["fields"]}
+        self.assertIn("decimal_places", all_keys)
+        self.assertIn("credits_ever_enabled", all_keys)
+
+        display = [field["key"] for field in credits["display_fields"]]
+        self.assertLessEqual(len(display), 4, "credits-raden får inte bli en vägg")
+        self.assertEqual(display[0], "used_credits", "viktigast först")
+        self.assertIn("monthly_limit", display)
+        self.assertNotIn("decimal_places", display)
+        self.assertNotIn("credits_ever_enabled", display)
+
+    def test_unknown_object_keys_still_render(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+        self.assertIn("nimbus_quill", by_key)
+        self.assertEqual(by_key["nimbus_quill"]["label"], "Nimbus quill")
+        self.assertFalse(by_key["nimbus_quill"]["known"])
+
+    def test_text_output_stays_readable(self):
+        self.serve_shape()
+        result = self.run_script("--text", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+
+        self.assertIn("Vecka – Opus", out)
+        self.assertIn("Vecka – Sonnet", out)
+        # Ingen rad får bli absurt lång.
+        longest = max(len(line) for line in out.splitlines())
+        self.assertLess(longest, 120, "en rad blev för lång:\n%s" % out)
+
+    def test_list_without_limits_is_reported_not_swallowed(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "five_hour": {"utilization": 1},
+                        "notices": ["hej", "hopp"],
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        by_key = {item["key"]: item for item in payload["unrecognized"]}
+        self.assertIn("notices", by_key)
+        self.assertEqual(by_key["notices"]["reason"], "lista utan gränser")
+
+    def test_list_entries_without_a_name_field_get_an_index_key(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps({"limits": [{"utilization": 5}, {"utilization": 6}]}),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        keys = [limit["key"] for limit in payload["limits"]]
+        self.assertEqual(keys, ["limits_0", "limits_1"])
+        for limit in payload["limits"]:
+            self.assertTrue(limit["label"].strip())
+
+
 class TestCaching(UsageTestCase):
     def test_cache_file_is_0600(self):
         self.serve(ok_json)
