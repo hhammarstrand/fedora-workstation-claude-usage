@@ -95,9 +95,22 @@ fi
 
 bold "4. Aktiverar"
 
-if gnome-extensions enable "$UUID" 2>/dev/null; then
+# Den här nyckeln stänger av ALLA användartillägg, oavsett enabled-extensions.
+# Missas den ser det ut som om tillägget aldrig installerades.
+DISABLE_ALL="$(gsettings get org.gnome.shell disable-user-extensions 2>/dev/null || echo unknown)"
+if [ "$DISABLE_ALL" = "true" ]; then
+    warn "disable-user-extensions är true — alla användartillägg är avstängda."
+    gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null \
+        && ok "Slog på användartillägg igen" \
+        || warn "Kunde inte ändra den. Kör: gsettings set org.gnome.shell disable-user-extensions false"
+fi
+
+# Felet är informativt (Shell känner oftast inte till tillägget än), så visa det
+# i stället för att svälja det.
+if ENABLE_ERR="$(gnome-extensions enable "$UUID" 2>&1)"; then
     ok "gnome-extensions enable $UUID"
 else
+    [ -n "$ENABLE_ERR" ] && info "gnome-extensions: $ENABLE_ERR"
     # Shell känner inte till tillägget förrän det startat om, så skriv nyckeln
     # direkt i stället. Nästa inloggning aktiverar det.
     CURRENT="$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || echo "@as []")"

@@ -103,6 +103,8 @@ extension/
   metadata.json             UUID, namn, shell-version.
   stylesheet.css            Adwaita-anpassad stil.
 install.sh                  Versionskoll, kopiering, aktivering, rökprovning.
+tools/
+  diagnose.sh               Samlar allt om varför tillägget inte syns.
 tests/
   run.sh                    Kör allt.
   test_claude_usage.py      44 tester mot CLI:t via en lokal stubbserver.
@@ -145,8 +147,14 @@ cd fedora-workstation-claude-usage
    reserv (Shell känner inte till tillägget förrän det startat om).
 6. Provkör `claude-usage --text` och visar resultatet.
 
+Steg 5 kollar också `disable-user-extensions` och återställer den om den är
+`true` — den nyckeln slår annars ut alla användartillägg oavsett allt annat.
+
 **Logga sedan ut och in igen.** Wayland kan inte ladda om GNOME Shell live, så
 `Alt+F2` → `r` finns inte som genväg där. Utloggning är det som gäller.
+
+Syns fortfarande inget i panelen efter utloggningen, kör `./tools/diagnose.sh` —
+se [Felsökning](#felsökning).
 
 <details>
 <summary>Manuellt, om du inte vill köra skriptet</summary>
@@ -536,19 +544,73 @@ som ändrats i intervallet:
 
 ## Felsökning
 
+### Börja här
+
+```bash
+./tools/diagnose.sh
+```
+
+Skriptet går igenom allt som kan göra att tillägget inte syns — GNOME-version,
+filer på disk, `shell-version`, dconf-nycklarna, vad Shell själv säger om
+tillägget, relevanta rader ur journalen, och en provkörning av CLI:t — och
+sammanfattar med hur många problem det hittade. Det skriver ingen hemlig
+information: credentials-filen kontrolleras bara för existens och ändringstid.
+
+För att följa loggen live:
+
 ```bash
 journalctl -f -o cat /usr/bin/gnome-shell
 ```
 
-**Tillägget syns inte i panelen.** Nästan alltid en versionsmiss. Kolla att
-`gnome-shell --version` finns i `shell-version`:
+### Tillägget syns inte i panelen
+
+Fyra orsaker står för nästan alla fall. `diagnose.sh` skiljer dem åt, men
+i korthet:
+
+**1. Du har inte loggat ut och in igen.** Wayland kan inte ladda om GNOME Shell
+live. Kontrollera att Shell känner till tillägget alls:
+
+```bash
+gnome-extensions list --user | grep claude-usage
+```
+
+**2. Alla användartillägg är avstängda.** En enda dconf-nyckel slår ut allt,
+oavsett vad `enabled-extensions` säger:
+
+```bash
+gsettings get org.gnome.shell disable-user-extensions   # ska vara false
+gsettings set org.gnome.shell disable-user-extensions false
+```
+
+Nyckeln sätts av "Extensions"-appen och GNOME Tweaks. `install.sh` kollar och
+återställer den numera, men har du kört en äldre version kan den stå kvar.
+
+**3. Versionsmiss.** Står inte din major-version i `shell-version` laddas
+tillägget tyst inte alls, utan felmeddelande:
+
+```bash
+gnome-shell --version
+cat ~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io/metadata.json
+./install.sh          # lägger in din version
+```
+
+**4. Undantag vid laddning.** Då är tillstånd `ERROR`:
 
 ```bash
 gnome-extensions info claude-usage@hhammarstrand.github.io
-cat ~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io/metadata.json
 ```
 
-Kolla också att du faktiskt loggat ut och in sedan installationen.
+`State` är nyckeln i den utskriften:
+
+| State | Betyder |
+| --- | --- |
+| `ENABLED` | Laddat och aktivt — då är problemet något annat |
+| `ERROR` | Undantag vid laddning; felet står i utskriften och i journalen |
+| `OUT_OF_DATE` | `shell-version` stämmer inte — orsak 3 ovan |
+| `INITIALIZED` / `DISABLED` | Känt men inte aktivt — orsak 1 eller 2 |
+
+Kör alltid `claude-usage --text` i terminalen också. Fungerar det men panelen är
+tom, ligger felet i tillägget och inte i datahämtningen — och tvärtom.
 
 **Panelen visar `!`.** Öppna popupen — där står orsaken. Vanliga fall:
 
