@@ -14,6 +14,7 @@ import {
     ClaudeUsageIndicator,
     clampPercent,
     formatAge,
+    formatCountdown,
     formatDelta,
     formatPercent,
     newBox,
@@ -130,6 +131,21 @@ test('formatDelta täcker dagar, timmar, minuter och gränsfall', () => {
     assert.equal(formatDelta(Infinity), null);
 });
 
+test('formatCountdown är kompakt — panelen står intill klockan', () => {
+    assert.equal(formatCountdown(0), 'nu');
+    assert.equal(formatCountdown(-5), 'nu');
+    assert.equal(formatCountdown(30), '<1m');
+    assert.equal(formatCountdown(90), '1m');
+    assert.equal(formatCountdown(3600), '1h 0m');
+    assert.equal(formatCountdown(7999), '2h 13m');
+    assert.equal(formatCountdown(300000), '3d 11h');
+    assert.equal(formatCountdown(null), null);
+    assert.equal(formatCountdown(NaN), null);
+    assert.equal(formatCountdown(Infinity), null);
+    // Kortare än popupens format, annars knuffar panelen klockan i sidled.
+    assert.ok(formatCountdown(7999).length < formatDelta(7999).length);
+});
+
 test('formatPercent avrundar heltal och behåller decimal när det spelar roll', () => {
     assert.equal(formatPercent(42), '42 %');
     assert.equal(formatPercent(42.02), '42 %');
@@ -184,12 +200,42 @@ test('newBox sätter den orienteringsproperty som finns i denna Shell-version', 
 
 // ------------------------------------------------------------------- panelen
 
-test('panelen visar högsta procenten och prickens färg', async () => {
+test('panelen visar sessionsgränsen med nedräkning, inte högsta värdet', async () => {
     const indicator = await build();
-    assert.equal(indicator._panelLabel.text, '94 %', 'högsta värdet, avrundat');
+    // Minuten kan tippa över medan testet kör, så bara timmen låses fast.
+    assert.match(indicator._panelLabel.text, /^42 % · 2h \d+m$/);
+    assert.ok(!indicator._panelLabel.text.startsWith('94'),
+        'veckogränsen på 93.5 % ska inte ta över panelen');
     assert.match(indicator._dot.style_class, /claude-usage-dot/);
-    assert.match(indicator._dot.style_class, /claude-usage-crit/);
+    // Färgen följer sessionen (ok), inte max_severity (crit).
+    assert.match(indicator._dot.style_class, /claude-usage-ok/);
     assert.equal(indicator._panelLabel.opacity, 255);
+    indicator.destroy();
+});
+
+test('panelens nedräkning tickar med klockan, utan nätverksanrop', async () => {
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 42, 'ok',
+            {resets_at_epoch: Date.now() / 1000 + 7500})],
+        credits: null,
+    }));
+    assert.match(indicator._panelLabel.text, /^42 % · 2h \d+m$/);
+
+    indicator._panelEpoch = Date.now() / 1000 + 90;
+    const spawnsBefore = state.spawns.length;
+    fireTimer(indicator._clockTimerId);
+    assert.equal(state.spawns.length, spawnsBefore, 'klockticket ska inte hämta data');
+    assert.equal(indicator._panelLabel.text, '42 % · 1m');
+    indicator.destroy();
+});
+
+test('gräns utan resets_at ger panelen procent utan nedräkning', async () => {
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 42, 'ok',
+            {resets_at_epoch: null})],
+        credits: null,
+    }));
+    assert.equal(indicator._panelLabel.text, '42 %');
     indicator.destroy();
 });
 
@@ -219,6 +265,99 @@ test('cachad data dimmas i panelen', async () => {
     indicator.destroy();
 });
 
+// -------------------------------------------------------------- inställningar
+
+/**
+ * Minimal Gio.Settings-ersättare. Indikatorn rör bara get_*/connect/disconnect,
+ * så en vanlig JS-klass räcker — och håller testerna oberoende av GSettings.
+ */
+function fakeSettings(values = {}) {
+    const store = {
+        'panel-source': 'session',
+        'show-countdown': true,
+        'refresh-interval': 60,
+        'panel-box': 'center',
+        'panel-position': 1,
+        'check-for-updates': false,
+        'last-update-check': 0,
+        ...values,
+    };
+    let nextId = 1;
+    const handlers = new Map();
+    return {
+        store,
+        handlers,
+        get_string: key => store[key],
+        get_boolean: key => store[key],
+        get_int: key => store[key],
+        get_int64: key => store[key],
+        set_int64: (key, value) => {
+            store[key] = value;
+        },
+        set_string: (key, value) => {
+            store[key] = value;
+            for (const [, entry] of handlers) {
+                if (entry.signal === `changed::${key}`)
+                    entry.callback();
+            }
+        },
+        connect(signal, callback) {
+            const id = nextId++;
+            handlers.set(id, {signal, callback});
+            return id;
+        },
+        disconnect(id) {
+            handlers.delete(id);
+        },
+    };
+}
+
+async function buildWith(settings, object = payload()) {
+    resetState();
+    setStdout(object);
+    const indicator = new ClaudeUsageIndicator(SCRIPT, settings);
+    await flush();
+    return indicator;
+}
+
+test('panel-source max låter den högsta gränsen styra panelen', async () => {
+    const indicator = await buildWith(fakeSettings({'panel-source': 'max'}));
+    assert.match(indicator._panelLabel.text, /^94 % · /, 'högsta värdet, avrundat');
+    assert.match(indicator._dot.style_class, /claude-usage-crit/);
+    indicator.destroy();
+});
+
+test('show-countdown av ger bara procenten', async () => {
+    const indicator = await buildWith(fakeSettings({'show-countdown': false}));
+    assert.equal(indicator._panelLabel.text, '42 %');
+    indicator.destroy();
+});
+
+test('en ändrad inställning slår igenom utan omstart', async () => {
+    const settings = fakeSettings();
+    const indicator = await buildWith(settings);
+    assert.match(indicator._panelLabel.text, /^42 % · /);
+
+    settings.set_string('panel-source', 'max');
+    assert.match(indicator._panelLabel.text, /^94 % · /,
+        'panelen ska rita om sig direkt när inställningen ändras');
+    indicator.destroy();
+});
+
+test('utan GSettings används standardvärdena i stället för att krascha', async () => {
+    const indicator = await buildWith(null);
+    assert.match(indicator._panelLabel.text, /^42 % · /);
+    indicator.destroy();
+});
+
+test('destroy kopplar bort inställningssignalerna', async () => {
+    const settings = fakeSettings();
+    const indicator = await buildWith(settings);
+    assert.ok(settings.handlers.size > 0, 'något ska vara kopplat');
+    indicator.destroy();
+    assert.equal(settings.handlers.size, 0, 'inget får ligga kvar');
+});
+
 // ------------------------------------------------------------------- popupen
 
 test('popupen får en rad per gräns, credits sist, plus Uppdatera nu', async () => {
@@ -234,7 +373,9 @@ test('popupen får en rad per gräns, credits sist, plus Uppdatera nu', async ()
     assert.ok(all.some(text => text === '0,00 / 85,00 EUR'), 'beloppen i rubriken');
     assert.ok(all.some(text => text.includes('Disabled reason: out_of_credits')));
     assert.ok(!all.some(text => text.includes('decimal_places')), 'ingen fältvägg');
-    assert.equal(all.at(-1), 'Uppdatera nu', 'sista posten ska vara Uppdatera nu');
+    // Åtgärdsposterna ligger sist: hämta om, och versionskollen.
+    assert.equal(all.at(-2), 'Uppdatera nu');
+    assert.equal(all.at(-1), 'Sök efter uppdateringar');
 
     // Credits ska ligga efter alla gränsrader.
     const creditsIndex = all.findIndex(text => text === 'Credits');
@@ -254,7 +395,7 @@ test('extras hamnar under en egen rubrik och driver inte panelen', async () => {
         max_severity: 'ok',
     }));
 
-    assert.equal(indicator._panelLabel.text, '10 %', 'extras får inte höja siffran');
+    assert.match(indicator._panelLabel.text, /^10 %( ·|$)/, 'extras får inte höja siffran');
     assert.match(indicator._dot.style_class, /claude-usage-ok/,
         'en okänd nyckel på 99 % får inte färga panelen röd');
 
@@ -455,7 +596,7 @@ test('429 med cachad data visar siffrorna och att de är cachade', async () => {
     assert.ok(all.some(text => text.includes('Retry-After: 37')));
     // Siffrorna finns kvar.
     assert.ok(all.some(text => text.includes('Session (5 h)')));
-    assert.equal(indicator._panelLabel.text, '94 %');
+    assert.match(indicator._panelLabel.text, /^42 % · 2h \d+m$/);
     indicator.destroy();
 });
 
@@ -484,14 +625,14 @@ test('utgången token utan cache ger fel, inte tom panel', async () => {
 
 test('ett fel efter lyckad hämtning behåller de senaste siffrorna', async () => {
     const indicator = await build();
-    assert.equal(indicator._panelLabel.text, '94 %');
+    assert.match(indicator._panelLabel.text, /^42 % · 2h \d+m$/);
 
     // Nästa körning misslyckas helt.
     state.subprocess = {throwOnSpawn: 'skriptet försvann'};
     await indicator._refresh(false);
     await flush();
 
-    assert.equal(indicator._panelLabel.text, '94 %', 'gamla siffror ska kvarstå');
+    assert.match(indicator._panelLabel.text, /^42 % · /, 'gamla siffror ska kvarstå');
     assert.ok(menuTexts(indicator).some(text => text.includes('skriptet försvann')));
     // ...men de ska märkas som gamla, trots att svaret sa stale: false.
     assert.equal(indicator._panelLabel.opacity, 145);

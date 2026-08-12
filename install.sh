@@ -45,6 +45,8 @@ bold "2. Installerar ~/.local/bin/claude-usage"
 install -d -m 755 "$BIN_DIR"
 install -m 755 "$SRC_DIR/bin/claude-usage" "$BIN_DIR/claude-usage"
 ok "$BIN_DIR/claude-usage"
+install -m 755 "$SRC_DIR/bin/claude-usage-update" "$BIN_DIR/claude-usage-update"
+ok "$BIN_DIR/claude-usage-update"
 
 case ":${PATH}:" in
     *":${BIN_DIR}:"*) ;;
@@ -58,9 +60,43 @@ bold "3. Installerar tillägget"
 
 install -d -m 755 "$EXT_DIR"
 install -m 644 "$SRC_DIR/extension/extension.js"   "$EXT_DIR/extension.js"
+install -m 644 "$SRC_DIR/extension/prefs.js"       "$EXT_DIR/prefs.js"
 install -m 644 "$SRC_DIR/extension/stylesheet.css" "$EXT_DIR/stylesheet.css"
 install -m 644 "$SRC_DIR/extension/metadata.json"  "$EXT_DIR/metadata.json"
 ok "$EXT_DIR"
+
+# Inställningarna ligger i GSettings. Utan ett kompilerat schema kastar
+# getSettings() och tillägget skulle inte kunna öppna sin dialog.
+install -d -m 755 "$EXT_DIR/schemas"
+install -m 644 "$SRC_DIR/extension/schemas/"*.gschema.xml "$EXT_DIR/schemas/"
+if command -v glib-compile-schemas >/dev/null 2>&1; then
+    if glib-compile-schemas "$EXT_DIR/schemas" 2>/dev/null; then
+        ok "Schemat kompilerat (inställningsdialogen fungerar)"
+    else
+        warn "glib-compile-schemas misslyckades — dialogen kommer inte att öppnas."
+    fi
+else
+    warn "glib-compile-schemas saknas. Installera glib2-devel för"
+    warn "inställningsdialogen; tillägget kör annars med standardvärdena."
+fi
+
+# Stämpla vilken commit som ligger installerad, så att claude-usage-update
+# kan jämföra mot GitHub i stället för att gissa.
+STAMP=""
+if [ -n "${CLAUDE_USAGE_INSTALL_COMMIT:-}" ]; then
+    STAMP="$CLAUDE_USAGE_INSTALL_COMMIT"
+elif command -v git >/dev/null 2>&1 \
+     && git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    STAMP="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+fi
+if [ -n "$STAMP" ]; then
+    printf '%s\n' "$STAMP" > "$EXT_DIR/.installed-commit"
+    ok "Version stämplad: ${STAMP:0:12}"
+else
+    rm -f "$EXT_DIR/.installed-commit"
+    info "Ingen commit att stämpla (inget git-arkiv) — uppdateringskollen"
+    info "kan då inte avgöra om det finns något nyare."
+fi
 
 # Se till att den körande versionen står i shell-version, annars laddas
 # tillägget tyst inte alls.
