@@ -110,7 +110,10 @@ fi
 if ENABLE_ERR="$(gnome-extensions enable "$UUID" 2>&1)"; then
     ok "gnome-extensions enable $UUID"
 else
-    [ -n "$ENABLE_ERR" ] && info "gnome-extensions: $ENABLE_ERR"
+    # Väntat före första utloggningen: den körande Shell-processen skannade
+    # tilläggskatalogen vid uppstart och känner alltså inte till oss än.
+    [ -n "$ENABLE_ERR" ] && info "Shell känner inte till tillägget än — normalt"
+    [ -n "$ENABLE_ERR" ] && info "före utloggning. Skriver inställningen direkt i stället."
     # Shell känner inte till tillägget förrän det startat om, så skriv nyckeln
     # direkt i stället. Nästa inloggning aktiverar det.
     CURRENT="$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || echo "@as []")"
@@ -157,13 +160,29 @@ fi
 # ----------------------------------------------------------------- 6. nästa steg
 
 bold "6. Sista steget"
-if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
-    info "Du kör Wayland, som inte kan ladda om GNOME Shell live."
-    info "Logga ut och in igen för att få upp tillägget i panelen."
+
+# Avgörande skillnad: känner den KÖRANDE Shell-processen till tillägget?
+# GNOME Shell skannar tilläggskatalogen bara vid uppstart, så ett tillägg som
+# installerats under en pågående session finns inte för Shell — hur rätt allt
+# annat än är. Då hjälper bara utloggning; att köra install.sh igen gör inget.
+if gnome-extensions info "$UUID" >/dev/null 2>&1; then
+    ok "GNOME Shell känner till tillägget"
+    info "Syns det inte i panelen ändå: kör ./tools/diagnose.sh"
 else
-    info "Logga ut och in igen för att få upp tillägget i panelen."
-    info "(På X11 räcker Alt+F2, 'r', Enter — men logga ut om du är osäker.)"
+    warn "Din GNOME-session startade innan tillägget installerades."
+    info ""
+    info "GNOME Shell läser tilläggskatalogen bara när den startar, så tillägget"
+    info "syns inte förrän du loggat ut och in igen. Allt annat är redan på plats"
+    info "— du behöver inte köra install.sh en gång till efteråt."
+    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+        info "(Wayland kan inte ladda om Shell live, så Alt+F2 → r finns inte här.)"
+    else
+        info "(På X11 räcker Alt+F2, 'r', Enter — men logga ut om du är osäker.)"
+    fi
+    info ""
+    bold "   Logga ut:  gnome-session-quit --logout"
 fi
 echo
-info "Felsökning:  journalctl -f -o cat /usr/bin/gnome-shell"
+info "Felsökning:  ./tools/diagnose.sh"
+info "Loggen:      journalctl -f -o cat /usr/bin/gnome-shell"
 info "Rå JSON:     claude-usage --raw"

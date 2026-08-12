@@ -341,6 +341,31 @@ test('okänd nyckel märks med stjärna och får en fotnot', async () => {
     indicator.destroy();
 });
 
+test('nycklar utan värde samlas på en rad, skilda från de otolkade', async () => {
+    // Ett riktigt svar har ett tiotal null-nycklar; blir de en rad var fyller
+    // de hela popupen.
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 12, 'ok')],
+        credits: null,
+        unrecognized: [
+            {key: 'tangelo', reason: 'utan värde'},
+            {key: 'amber_ladder', reason: 'utan värde'},
+            {key: 'member_dashboard_available', reason: 'skalärt värde'},
+        ],
+        max_percent: 12,
+        max_severity: 'ok',
+    }));
+    const all = menuTexts(indicator);
+    const empty = all.filter(text => text.includes('Utan värde:'));
+    assert.equal(empty.length, 1);
+    assert.ok(empty[0].includes('tangelo'));
+    assert.ok(empty[0].includes('amber_ladder'));
+    assert.ok(!empty[0].includes('member_dashboard_available'));
+    assert.ok(all.some(
+        text => text === 'Ej tolkade nycklar: member_dashboard_available'));
+    indicator.destroy();
+});
+
 test('tomt svar utan gränser säger det i stället för att visa en tom meny', async () => {
     const indicator = await build(payload({
         limits: [], credits: null, max_percent: null, max_severity: 'unknown',

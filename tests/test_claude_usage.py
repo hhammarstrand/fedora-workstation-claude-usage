@@ -609,6 +609,144 @@ class TestRealWorldShape(UsageTestCase):
             self.assertTrue(item["label"].strip())
 
 
+class TestKindListShape(UsageTestCase):
+    """Formen som faktiskt observerats i ett riktigt svar (aug 2026).
+
+    Posterna i `limits` namnger sig med `kind` — inte `type` — och en
+    modellgräns bär sitt namn i ett nästlat `scope`. Utan översättning blir de
+    limits_0..2: två dubbletter av toppnycklarna, och en riktig veckogräns som
+    tappar sitt tidsfönster och därför varken syns bland gränserna eller
+    räknas i panelen.
+    """
+
+    SHAPE = {
+        "five_hour": {"utilization": 83, "resets_at": "2026-08-12T20:10:00Z"},
+        "seven_day": {"utilization": 29, "resets_at": "2026-08-19T03:59:59Z"},
+        # Alla dessa är null i riktiga svar — "gäller inte det här kontot".
+        "seven_day_opus": None,
+        "seven_day_sonnet": None,
+        "tangelo": None,
+        "amber_ladder": None,
+        "member_dashboard_available": False,
+        "limits": [
+            {
+                "group": "session",
+                "kind": "session",
+                "percent": 83,
+                "resets_at": "2026-08-12T20:10:00Z",
+                "scope": None,
+                "severity": "warning",
+            },
+            {
+                "group": "weekly",
+                "kind": "weekly_all",
+                "percent": 29,
+                "resets_at": "2026-08-19T03:59:59Z",
+                "scope": None,
+                "severity": "normal",
+            },
+            {
+                "group": "weekly",
+                "kind": "weekly_scoped",
+                "percent": 55,
+                "resets_at": "2026-08-19T04:00:00Z",
+                "scope": {"model": {"display_name": "Fable", "id": None},
+                          "surface": None},
+                "severity": "normal",
+            },
+        ],
+    }
+
+    def serve_shape(self):
+        self.serve(lambda n: (200, "application/json", json.dumps(self.SHAPE)))
+
+    def test_kind_maps_onto_the_top_level_keys(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        keys = [limit["key"] for limit in payload["limits"]]
+
+        self.assertEqual(keys.count("five_hour"), 1, "session är ingen ny gräns")
+        self.assertEqual(keys.count("seven_day"), 1, "weekly_all är ingen ny gräns")
+        self.assertNotIn("limits_0", keys)
+        self.assertNotIn("limits_0", [item["key"] for item in payload["extras"]])
+
+    def test_scoped_limit_becomes_a_real_limit_with_the_server_name(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit for limit in payload["limits"]}
+
+        self.assertIn("seven_day_fable", by_key, "modellgränsen får inte tappas")
+        limit = by_key["seven_day_fable"]
+        self.assertAlmostEqual(limit["percent"], 55.0)
+        self.assertEqual(limit["label"], "Vecka – Fable")
+        # Namnet kom från servern, inte från en gissning -> ingen asterisk.
+        self.assertTrue(limit["known"])
+        self.assertEqual(limit["window_seconds"], 604800)
+        self.assertIsNotNone(limit["resets_at_epoch"])
+
+    def test_scoped_limit_counts_in_the_panel(self):
+        """55 % får inte försvinna ur max_percent bara för att den låg i en lista."""
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        self.assertAlmostEqual(payload["max_percent"], 83.0)
+
+        percents = {limit["key"]: limit["percent"] for limit in payload["limits"]}
+        self.assertAlmostEqual(percents["seven_day_fable"], 55.0)
+        self.assertEqual(payload["extras"], [], "inga listposter ska hamna i Övrigt")
+
+    def test_empty_keys_are_separated_from_real_scalars(self):
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        by_key = {item["key"]: item for item in payload["unrecognized"]}
+
+        self.assertEqual(by_key["tangelo"]["reason"], "utan värde")
+        self.assertEqual(by_key["amber_ladder"]["reason"], "utan värde")
+        # En skalär med ett faktiskt värde är något annat och behåller det.
+        self.assertEqual(
+            by_key["member_dashboard_available"]["reason"], "skalärt värde"
+        )
+        self.assertEqual(by_key["member_dashboard_available"]["value"], "nej")
+
+    def test_text_output_collapses_the_empty_keys(self):
+        self.serve_shape()
+        result = self.run_script("--text", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+
+        self.assertIn("Vecka – Fable", out)
+        self.assertNotIn("Limits 0", out, "inga dubbletter av toppnycklarna")
+        self.assertNotIn("Övrigt", out)
+        # Tio tomma nycklar får inte bli tio rader.
+        empty_lines = [line for line in out.splitlines() if "Utan värde:" in line]
+        self.assertEqual(len(empty_lines), 1)
+        self.assertIn("tangelo", empty_lines[0])
+        self.assertIn("seven_day_opus", empty_lines[0])
+
+    def test_unnamed_scopes_do_not_collide(self):
+        """Två poster med samma kind men olika scope måste få skilda nycklar."""
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "limits": [
+                            {"kind": "weekly_scoped", "percent": 10,
+                             "scope": {"model": {"display_name": "Opus"}}},
+                            {"kind": "weekly_scoped", "percent": 20,
+                             "scope": {"model": {"display_name": "Sonnet"}}},
+                        ]
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        by_key = {limit["key"]: limit["percent"] for limit in payload["limits"]}
+        self.assertAlmostEqual(by_key["seven_day_opus"], 10.0)
+        self.assertAlmostEqual(by_key["seven_day_sonnet"], 20.0)
+
+
 class TestCaching(UsageTestCase):
     def test_cache_file_is_0600(self):
         self.serve(ok_json)

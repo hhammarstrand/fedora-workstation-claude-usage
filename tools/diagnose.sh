@@ -23,6 +23,10 @@ info()    { printf '    %s\n' "$*"; }
 PROBLEMS=0
 problem() { bad "$*"; PROBLEMS=$((PROBLEMS + 1)); }
 
+#: Sätts när allt är rätt installerat men sessionen är äldre än installationen.
+#: Det är inte ett problem, bara ett steg som återstår.
+PENDING_LOGOUT=0
+
 printf '\033[1mClaude Usage — diagnos\033[0m\n'
 printf 'Klistra in hela utskriften.\n'
 
@@ -48,9 +52,17 @@ info "Skrivbord:   ${XDG_CURRENT_DESKTOP:-okänt}"
 # Hur länge har den nuvarande gnome-shell-processen levt? Kortare tid än
 # installationen betyder att utloggningen faktiskt skedde.
 SHELL_PID="$(pgrep -u "$(id -u)" -x gnome-shell 2>/dev/null | head -1)"
+SHELL_START_EPOCH=""
 if [ -n "$SHELL_PID" ]; then
     STARTED="$(ps -o lstart= -p "$SHELL_PID" 2>/dev/null | sed 's/^ *//')"
     info "gnome-shell (pid $SHELL_PID) startad: ${STARTED:-okänt}"
+    # etimes (sekunder sedan start) är locale-oberoende, till skillnad från
+    # lstart — och det är den vi räknar på i avsnitt 5.
+    ELAPSED="$(ps -o etimes= -p "$SHELL_PID" 2>/dev/null | tr -d ' ')"
+    case "$ELAPSED" in
+        ''|*[!0-9]*) ;;
+        *) SHELL_START_EPOCH=$(( $(date +%s) - ELAPSED )) ;;
+    esac
 else
     warn "Hittar ingen körande gnome-shell-process."
 fi
@@ -157,10 +169,22 @@ section "5. Vad GNOME Shell själv säger"
 if command -v gnome-extensions >/dev/null 2>&1; then
     if gnome-extensions list --user 2>/dev/null | grep -qF "$UUID"; then
         ok "Shell känner till tillägget"
+    elif [ -n "$SHELL_START_EPOCH" ] && [ -f "$EXT_DIR/extension.js" ] \
+         && [ "$(stat -c %Y "$EXT_DIR/extension.js" 2>/dev/null || echo 0)" \
+              -gt "$SHELL_START_EPOCH" ]; then
+        # Inte ett fel: GNOME Shell skannar tilläggskatalogen bara vid uppstart,
+        # och den här sessionen startade före installationen. Att rapportera det
+        # som ett problem skickar folk på jakt efter en bugg som inte finns.
+        PENDING_LOGOUT=1
+        warn "Shell känner inte till tillägget än — väntar på utloggning"
+        info "Tillägget installerades EFTER att den här sessionen startade."
+        info "GNOME Shell läser tilläggskatalogen bara när den startar, så det"
+        info "syns först vid nästa inloggning. Inget är fel — logga ut:"
+        info "  gnome-session-quit --logout"
     else
         problem "Shell känner INTE till tillägget"
-        info "Har du loggat ut och in igen sedan installationen?"
-        info "Wayland kan inte ladda om Shell live."
+        info "Sessionen startade efter installationen, så en utloggning till"
+        info "hjälper inte. Kolla katalognamn/uuid i avsnitt 2 och fel i 6."
     fi
     echo
     gnome-extensions info "$UUID" 2>&1 | sed 's/^/    /'
@@ -225,10 +249,18 @@ fi
 
 section "8. Sammanfattning"
 
-if [ "$PROBLEMS" -eq 0 ]; then
+if [ "$PROBLEMS" -eq 0 ] && [ "$PENDING_LOGOUT" -eq 1 ]; then
+    ok "Inget är fel — installationen är komplett."
+    warn "Ett steg återstår: logga ut och in igen."
+    info "  gnome-session-quit --logout"
+    info "Den körande GNOME Shell startade före installationen och skannar"
+    info "tilläggskatalogen bara vid uppstart. Kör inte install.sh igen — det"
+    info "ändrar inget; bara en ny session laddar tillägget."
+elif [ "$PROBLEMS" -eq 0 ]; then
     ok "Inga uppenbara fel hittade."
     info "Om panelen ändå är tom: kolla State i avsnitt 5 och journalen i 6."
 else
     bad "$PROBLEMS problem hittade — se ✗ ovan."
+    [ "$PENDING_LOGOUT" -eq 1 ] && info "Dessutom återstår en utloggning (avsnitt 5)."
 fi
 echo
