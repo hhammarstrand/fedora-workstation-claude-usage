@@ -23,13 +23,13 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 #: Repot uppdateringarna kommer från. Enda källan — ingen annan URL används.
@@ -67,6 +67,25 @@ class UpdateError(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+def require_safe_url(url: str, what: str) -> str:
+    """Hämta bara över https — det här blir kod som körs.
+
+    API_BASE och CODELOAD_BASE går att sätta via miljön (testerna gör det).
+    Utan den här kontrollen skulle en satt variabel kunna peka uppdateraren
+    mot en okrypterad, godtycklig värd. http tillåts bara mot loopback.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        return url
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "http" and host in ("127.0.0.1", "::1", "localhost"):
+        return url
+    raise UpdateError(
+        "insecure_source",
+        "%s måste vara https (eller http mot localhost)." % what,
+    )
 
 
 def http_json(url: str):
@@ -117,7 +136,8 @@ def installed_version():
 
 def latest_commit():
     """-> (sha, kort meddelande). Ett anrop, inget hämtat innehåll."""
-    data = http_json("%s/repos/%s/commits/%s" % (API_BASE, REPO, BRANCH))
+    base = require_safe_url(API_BASE, "CLAUDE_USAGE_API_BASE")
+    data = http_json("%s/repos/%s/commits/%s" % (base, REPO, BRANCH))
     if not isinstance(data, dict):
         raise UpdateError("bad_response", "Oväntat svar från GitHub.")
     sha = data.get("sha")
@@ -164,7 +184,8 @@ def safe_extract(archive: tarfile.TarFile, destination: str) -> None:
 
 def download(sha: str, destination: str) -> str:
     """Hämta tarballen för sha, packa upp, returnera repots rotkatalog."""
-    url = "%s/%s/tar.gz/%s" % (CODELOAD_BASE, REPO, sha)
+    base = require_safe_url(CODELOAD_BASE, "CLAUDE_USAGE_CODELOAD_BASE")
+    url = "%s/%s/tar.gz/%s" % (base, REPO, sha)
     request = urllib.request.Request(url, method="GET")
     request.add_header("User-Agent", USER_AGENT)
     archive_path = os.path.join(destination, "source.tar.gz")
@@ -234,9 +255,12 @@ def apply_update():
 
         output = completed.stdout.decode("utf-8", "replace")
         if completed.returncode != 0:
+            # Utan de sista raderna är felet omöjligt att felsöka från popupen.
+            tail = " / ".join(output.strip().splitlines()[-3:])
             raise UpdateError(
                 "install_failed",
-                "install.sh misslyckades (kod %d)." % completed.returncode,
+                "install.sh misslyckades (kod %d)%s"
+                % (completed.returncode, ": %s" % tail if tail else "."),
             )
 
     return {

@@ -125,9 +125,11 @@ tools/
 tests/
   run.sh                    Kör allt.
   test_claude_usage.py      62 tester mot CLI:t via en lokal stubbserver.
-  test_claude_usage_update.py  19 tester mot uppdateraren, mot en GitHub-stubb.
+  test_claude_usage_update.py  20 tester mot uppdateraren, mot en GitHub-stubb.
+  gjs/
+    test_prefs.js           26 kontroller av dialogen, i gjs mot riktiga Gtk/Adw.
   js/
-    test_extension.mjs      47 tester mot extension.js.
+    test_extension.mjs      49 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
     loader.mjs              ESM-loader som mappar gi:// och resource:// till stubbarna.
     register.mjs            Registrerar loadern.
@@ -629,6 +631,7 @@ Stabila strängar, avsedda att jämföras mot i kod:
 | `server_error` | HTTP 5xx |
 | `http_error` | Annan oväntad status |
 | `network_error` | Uppkoppling, DNS eller tidsgräns |
+| `insecure_endpoint` | `CLAUDE_USAGE_ENDPOINT` pekar på annat än https (loopback undantaget) |
 | `bad_response` | Svaret var inte JSON, eller inte ett objekt |
 | `internal_error` | Bugg i skriptet |
 
@@ -658,6 +661,11 @@ mest ett per 15 s om du sitter och klickar.
 - Token läses från `~/.claude/.credentials.json`
   (`claudeAiOauth.accessToken`). **Filen läses bara, aldrig skrivs** — Claude
   Code sköter förnyelsen själv.
+- **Token skickas bara över https.** Den går som `Authorization: Bearer` mot
+  `CLAUDE_USAGE_ENDPOINT`, och den variabeln kan sättas av vad som helst som
+  når processens miljö. Skriptet vägrar därför alla scheman utom `https` —
+  utom mot `localhost`/`127.0.0.1`, som testsviten behöver. Utan den
+  kontrollen räckte en satt miljövariabel för att skicka token i klartext.
 - Bara `accessToken` läses. `refreshToken` rörs inte.
 - **Token skrivs aldrig ut** — inte i loggar, inte i felmeddelanden. Alla
   felsträngar går genom en scrubber som maskar både den kända token och allt som
@@ -931,8 +939,14 @@ claude-usage --force --text
 - **Uppdateringen kräver utloggning för att synas.** Nya filer hamnar på disk
   direkt, men Shell laddar tillägg bara vid uppstart. Det gäller alla vägar in —
   popupen, `install.sh` eller `git pull`.
-- **Dialogen är testad utan att ha visats.** Sidorna byggs och kopplas mot ett
-  riktigt kompilerat schema i testet, men ingen har sett dem på skärmen.
+- **Dialogen är testad utan att ha visats.** `tests/gjs/test_prefs.js` bygger
+  sidorna i gjs mot riktiga Gtk/Adw och ett riktigt kompilerat schema, och
+  kontrollerar att varje rad speglar sin nyckel åt båda hållen — men ingen har
+  sett dem på en skärm.
+- **Uppdateringen verifierar ingen signatur.** Den litar på https och på att
+  repot är ditt. Den som kan pusha till repot kan därmed köra kod på maskinen
+  vid nästa uppdatering — samma förtroendemodell som `git pull && ./install.sh`,
+  men värd att veta om innan man slår på automatisk kontroll.
 - **Bara svenska strängar.** Ingen gettext-uppsättning.
 - **Endpointen kan sluta fungera utan förvarning.** Se varningen högst upp.
 
@@ -942,14 +956,14 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (81 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (84 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,
 HTML-svar, 401, utgången token och saknad credentials-fil alla ger cachad data
 eller ett läsbart fel — och att token aldrig läcker i något utdataläge.
 
-**JS-testerna (47 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
+**JS-testerna (49 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
 ESM-loader som mappar `gi://` och `resource://` till `tests/js/stubs.mjs`. De
 verifierar panel, stapelbredder, nedräkningar, felläge, placering i mittboxen
 och att `disable()` städar timers, vakthund och signalhandlers. Stubbarna är

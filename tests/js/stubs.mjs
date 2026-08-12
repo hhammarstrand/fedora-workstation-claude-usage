@@ -356,8 +356,20 @@ export const PopupMenu = {
 export const Main = {
     panel: {
         statusArea: {},
+        // Strikt som den riktiga panelen: rollen får bara tas en gång, och
+        // platsen frigörs när indikatorn förstörs (Panel._addToPanelBox
+        // kopplar en destroy-hanterare som tar bort den ur statusArea).
+        // Utan det skulle en flytt av indikatorn se ut att fungera i test
+        // men kasta "Extension point conflict" på en riktig Shell.
         addToStatusArea(role, indicator, position, box) {
+            if (this.statusArea[role]) {
+                throw new Error(
+                    `Extension point conflict: there is already a status indicator for role ${role}`);
+            }
             this.statusArea[role] = {indicator, position, box};
+            indicator.connect('destroy', () => {
+                delete this.statusArea[role];
+            });
             return indicator;
         },
     },
@@ -367,5 +379,17 @@ export class Extension {
     constructor(metadata = {}) {
         this.metadata = metadata;
         this.uuid = metadata.uuid ?? 'claude-usage@test';
+        this.openedPreferences = 0;
+    }
+
+    /** Sätts av testet när ett settings-objekt ska finnas. */
+    getSettings() {
+        if (!this.__settings)
+            throw new Error(`Schema could not be found for extension ${this.uuid}`);
+        return this.__settings;
+    }
+
+    openPreferences() {
+        this.openedPreferences++;
     }
 }

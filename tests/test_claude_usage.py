@@ -1097,13 +1097,32 @@ class TestCliContract(UsageTestCase):
         with open(SCRIPT, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.readline().strip(), "#!/usr/bin/env python3")
 
+    def test_plain_http_endpoint_is_refused(self):
+        """Token går som Bearer-header — den får aldrig gå okrypterad.
+
+        CLAUDE_USAGE_ENDPOINT kan sättas av vad som helst som når miljön, så
+        kontrollen ligger i skriptet och inte i dokumentationen.
+        """
+        result = self.run_script(
+            "--json", "--force", endpoint="http://example.invalid/usage")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "insecure_endpoint")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_localhost_http_is_allowed_for_testing(self):
+        """Annars vore testsviten själv omöjlig att köra."""
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        self.assertTrue(payload["ok"])
+
     def test_stdlib_only(self):
         with open(SCRIPT, "r", encoding="utf-8") as fh:
             source = fh.read()
         imported = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_.]+)", source, re.M))
         allowed = {
             "__future__", "argparse", "json", "os", "re", "sys", "tempfile",
-            "time", "urllib.error", "urllib.request", "datetime",
+            "time", "urllib.error", "urllib.parse", "urllib.request", "datetime",
         }
         self.assertTrue(
             imported <= allowed, "otillåtna importer: %s" % (imported - allowed)

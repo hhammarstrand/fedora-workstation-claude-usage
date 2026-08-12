@@ -97,8 +97,7 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
         bindCombo(settings, 'panel-box', box, PANEL_BOXES);
 
         const position = new Adw.SpinRow({
-            title: 'Plats inom den delen',
-            subtitle: '0 = före klockan, 1 = efter den',
+            title: 'Ordning inom den delen',
             adjustment: new Gtk.Adjustment({
                 lower: 0, upper: 20, step_increment: 1, page_increment: 1,
             }),
@@ -106,6 +105,30 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
         where.add(position);
         settings.bind('panel-position', position, 'value',
             Gio.SettingsBindFlags.DEFAULT);
+
+        // Vad siffran betyder beror på vilken del man valt: i mitten finns
+        // bara klockan att förhålla sig till, i sidoboxarna är det en
+        // sorteringsordning bland alla ikoner.
+        const describePosition = () => {
+            const box = settings.get_string('panel-box');
+            if (box === 'center') {
+                position.subtitle = '0 = före klockan, 1 = efter klockan';
+            } else {
+                position.subtitle =
+                    'Lägre värde = längre åt vänster bland ikonerna';
+            }
+        };
+        describePosition();
+        const boxChangedId = settings.connect(
+            'changed::panel-box', describePosition);
+        position.connect('destroy', () => settings.disconnect(boxChangedId));
+
+        const hint = new Adw.ActionRow({
+            title: 'Ändringen syns direkt',
+            subtitle: 'Indikatorn flyttas utan att du behöver logga ut.',
+        });
+        hint.sensitive = false;
+        where.add(hint);
 
         return page;
     }

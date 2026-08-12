@@ -21,6 +21,9 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const CLOCK_INTERVAL = 15;
 /** Automatisk versionskoll görs som mest en gång per dygn. */
 const UPDATE_CHECK_INTERVAL = 86400;
+/** Nödbroms för uppdateraren. --apply hämtar och kör install.sh, så den
+ *  är rundligare än SUBPROCESS_TIMEOUT — men inte obegränsad. */
+const UPDATER_TIMEOUT = 240;
 /** Nödbroms om skriptet hänger — då blir panelen aldrig låst. */
 const SUBPROCESS_TIMEOUT = 20;
 /** Stapelbredd i px. Enda sanningen: CSS sätter ingen bredd. */
@@ -209,6 +212,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._updateAvailable = false;
         this._updateSha = null;
         this._updateBusy = false;
+        this._updateCancellable = null;
+        this._updateWatchdogId = 0;
+        this._statusIdleId = 0;
         // Får vara null: testerna kör utan GSettings, och en trasig
         // schemainstallation ska ge standardvärden i stället för ett undantag.
         this._settings = settings;
@@ -291,9 +297,11 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         if (!this._settings)
             return;
         // Panelen ritas om direkt; ingen utloggning för att byta inställning.
+        // Bara panelen beror på de här; popupens rader är desamma oavsett.
+        // Att rita om hela menyn skulle förstöra poster i onödan.
         for (const key of ['panel-source', 'show-countdown']) {
             this._settingsIds.push(this._settings.connect(
-                `changed::${key}`, () => this._rebuildMenu()));
+                `changed::${key}`, () => this._updatePanel()));
         }
         this._settingsIds.push(this._settings.connect(
             'changed::refresh-interval', () => this._startRefreshTimer()));
@@ -326,6 +334,19 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         if (this._watchdogTimerId) {
             GLib.Source.remove(this._watchdogTimerId);
             this._watchdogTimerId = 0;
+        }
+        if (this._updateWatchdogId) {
+            GLib.Source.remove(this._updateWatchdogId);
+            this._updateWatchdogId = 0;
+        }
+        if (this._statusIdleId) {
+            GLib.Source.remove(this._statusIdleId);
+            this._statusIdleId = 0;
+        }
+        if (this._updateCancellable) {
+            // Annars lever en nedladdning kvar efter att panelen är borta.
+            this._updateCancellable.cancel();
+            this._updateCancellable = null;
         }
         if (this._menuSignalId) {
             this.menu.disconnect(this._menuSignalId);
@@ -739,12 +760,13 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 'software-update-available-symbolic');
             installItem.connect('activate', () => this._applyUpdate());
             this.menu.addMenuItem(installItem);
-        } else {
-            const checkItem = new PopupMenu.PopupImageMenuItem(
-                'Sök efter uppdateringar', 'software-update-available-symbolic');
-            checkItem.connect('activate', () => this._checkForUpdate(true));
-            this.menu.addMenuItem(checkItem);
         }
+        // Finns kvar även när en uppdatering hittats: går installationen fel
+        // ska man kunna söka om utan att starta om Shell.
+        const checkItem = new PopupMenu.PopupImageMenuItem(
+            'Sök efter uppdateringar', 'software-update-available-symbolic');
+        checkItem.connect('activate', () => this._checkForUpdate(true));
+        this.menu.addMenuItem(checkItem);
 
         if (this._openPreferences) {
             const prefsItem = new PopupMenu.PopupImageMenuItem(
@@ -768,12 +790,34 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 reject(new Error(`Kan inte köra ${this._updaterPath}: ${error.message}`));
                 return;
             }
-            proc.communicate_utf8_async(null, null, (subprocess, result) => {
+
+            // --apply hämtar och kör install.sh och får ta tid, men aldrig
+            // obegränsat: utan vakthund fastnar _updateBusy för alltid och
+            // menyposten går inte att använda igen.
+            const cancellable = new Gio.Cancellable();
+            this._updateCancellable = cancellable;
+            let timedOut = false;
+            this._updateWatchdogId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT, UPDATER_TIMEOUT, () => {
+                    timedOut = true;
+                    this._updateWatchdogId = 0;
+                    cancellable.cancel();
+                    return GLib.SOURCE_REMOVE;
+                });
+
+            proc.communicate_utf8_async(null, cancellable, (subprocess, result) => {
+                if (this._updateWatchdogId) {
+                    GLib.Source.remove(this._updateWatchdogId);
+                    this._updateWatchdogId = 0;
+                }
+                this._updateCancellable = null;
                 try {
                     const [, stdout] = subprocess.communicate_utf8_finish(result);
                     resolve(JSON.parse(stdout));
                 } catch (error) {
-                    reject(new Error(error.message));
+                    reject(new Error(timedOut
+                        ? `claude-usage-update svarade inte inom ${UPDATER_TIMEOUT} s`
+                        : error.message));
                 }
             });
         });
@@ -787,6 +831,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         if (announce)
             this._setUpdateStatus('Söker efter uppdateringar…');
         try {
+            // Stämpla försöket direkt. Stämplas bara lyckade kontroller
+            // görs ett nytt anrop varje gång popupen öppnas så länge felet
+            // står kvar — och GitHub tål 60 anrop i timmen oautentiserat.
+            this._stampCheck();
             const result = await this._runUpdater('--check');
             if (this._disposed)
                 return;
@@ -797,7 +845,6 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 }
                 return;
             }
-            this._settings?.set_int64('last-update-check', Math.floor(Date.now() / 1000));
             if (result.update_available) {
                 this._updateAvailable = true;
                 this._updateSha = result.latest_commit;
@@ -845,9 +892,31 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         }
     }
 
+    /**
+      * Menyn får INTE ritas om synkront härifrån. Shell kopplar sin egen
+      * activate-hanterare med ConnectFlags.AFTER, så när den här körs pågår
+      * fortfarande postens signalemission — och removeAll() skulle förstöra
+      * just den posten mitt i den. Vi skjuter till nästa idle i stället.
+      */
     _setUpdateStatus(text) {
         this._updateStatus = text;
-        this._rebuildMenu();
+        if (this._statusIdleId)
+            return;
+        this._statusIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._statusIdleId = 0;
+            if (!this._disposed)
+                this._rebuildMenu();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _stampCheck() {
+        try {
+            this._settings?.set_int64(
+                'last-update-check', Math.floor(Date.now() / 1000));
+        } catch {
+            // Saknad nyckel ska inte fälla versionskollen.
+        }
     }
 
     /** Automatisk kontroll: högst en per dygn, och bara om den är påslagen. */

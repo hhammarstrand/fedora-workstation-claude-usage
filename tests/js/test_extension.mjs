@@ -824,3 +824,50 @@ test('enable() lägger indikatorn i panelen och disable() tar bort den', async (
     // disable() två gånger ska vara ofarligt.
     assert.doesNotThrow(() => extension.disable());
 });
+
+test('enable() följer panel-box och panel-position ur inställningarna', async () => {
+    resetState();
+    setStdout(payload());
+
+    const extension = new Extension({uuid: 'claude-usage@test'});
+    extension.__settings = fakeSettings({'panel-box': 'right', 'panel-position': 0});
+    extension.enable();
+    await flush();
+
+    const {Main} = await import('./stubs.mjs');
+    const entry = Main.panel.statusArea['claude-usage@test'];
+    assert.equal(entry.box, 'right');
+    assert.equal(entry.position, 0);
+
+    extension.disable();
+});
+
+test('en ändrad placering flyttar indikatorn utan att rollen krockar', async () => {
+    resetState();
+    setStdout(payload());
+
+    const settings = fakeSettings();
+    const extension = new Extension({uuid: 'claude-usage@test'});
+    extension.__settings = settings;
+    extension.enable();
+    await flush();
+
+    const {Main} = await import('./stubs.mjs');
+    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'center');
+    const first = extension._indicator;
+
+    // Indikatorn sitter i en panelbox och kan inte flyttas levande — den
+    // byggs om. Panelstubben kastar på dubbeltagen roll, precis som den
+    // riktiga, så testet fångar en glömd destroy.
+    settings.set_string('panel-box', 'right');
+    await flush();
+
+    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'right',
+        'indikatorn ska ha flyttats');
+    assert.notEqual(extension._indicator, first, 'en ny indikator ska ha byggts');
+    assert.ok(first.destroyed, 'den gamla ska vara förstörd');
+    assert.equal(state.timers.size, 2, 'inga timers får bli kvar från den gamla');
+
+    extension.disable();
+    assert.equal(state.timers.size, 0);
+});

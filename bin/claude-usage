@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -37,6 +38,7 @@ from datetime import datetime, timezone
 ENDPOINT = os.environ.get(
     "CLAUDE_USAGE_ENDPOINT", "https://claude.ai/api/oauth/usage"
 )
+
 BETA_HEADER = "oauth-2025-04-20"
 
 CREDENTIALS_PATH = os.environ.get(
@@ -268,9 +270,30 @@ def load_token():
 # --------------------------------------------------------------------------
 
 
+def require_safe_url(url: str, what: str) -> str:
+    """Vägra skicka något känsligt över en okrypterad förbindelse.
+
+    Token går med som Authorization-header. En CLAUDE_USAGE_ENDPOINT som
+    pekar på http:// skulle alltså skicka den i klartext — och variabeln kan
+    sättas av vad som helst som får ändra miljön. http tillåts bara mot
+    loopback, som testerna använder.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        return url
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "http" and host in ("127.0.0.1", "::1", "localhost"):
+        return url
+    raise UsageError(
+        "insecure_endpoint",
+        "%s måste vara https (eller http mot localhost): %s" % (what, parsed.scheme or "?"),
+    )
+
+
 def fetch_raw(token: str):
     """-> dict från servern. Kastar UsageError. Loggar aldrig token."""
-    request = urllib.request.Request(ENDPOINT, method="GET")
+    request = urllib.request.Request(
+        require_safe_url(ENDPOINT, "CLAUDE_USAGE_ENDPOINT"), method="GET")
     request.add_header("Authorization", "Bearer %s" % token)
     request.add_header("anthropic-beta", BETA_HEADER)
     request.add_header("Accept", "application/json")
