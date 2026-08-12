@@ -529,31 +529,117 @@ def limit_containers(raw: dict):
 
 #: Fältnamn som kan bära nyckeln för en gräns som ligger i en lista.
 LIST_KEY_FIELDS = (
-    "type", "limit_type", "key", "name", "id", "window", "scope", "period",
+    "kind", "type", "limit_type", "key", "name", "id", "window", "group",
+    "scope", "period",
 )
+
+#: Listposternas egna kodnamn för fönstret, översatta till samma nycklar som
+#: toppnivån använder. Bekräftat mot riktig data, där listan ser ut så här:
+#:   {"kind": "session",       "percent": 83, "scope": null}
+#:   {"kind": "weekly_all",    "percent": 29, "scope": null}
+#:   {"kind": "weekly_scoped", "percent": 55, "scope": {"model": {...}}}
+#: Utan översättningen blir posterna limits_0..2: två dubbletter av
+#: toppnycklarna, och en riktig modellgräns som tappar sitt tidsfönster.
+LIST_KIND_KEYS = {
+    "session": "five_hour",
+    "five_hour": "five_hour",
+    "five_hourly": "five_hour",
+    "daily": "one_day",
+    "weekly": "seven_day",
+    "weekly_all": "seven_day",
+    "weekly_scoped": "seven_day",
+    "seven_day": "seven_day",
+    "monthly": "thirty_day",
+}
+
+#: Fält där en scope-post kan bära sitt visningsnamn, och behållare att leta i.
+SCOPE_NAME_FIELDS = ("display_name", "name", "label", "title", "id")
+
+#: Etikett för en gräns som är begränsad till en modell eller yta. Namnet kommer
+#: från servern, inte från en gissning, så raden märks inte med *.
+SCOPED_LABELS = {
+    "five_hour": "Session (5 h) – %s",
+    "seven_day": "Vecka – %s",
+    "one_day": "Dygn – %s",
+    "thirty_day": "30 dagar – %s",
+}
+
+
+def scope_name(value, depth: int = 0):
+    """{"model": {"display_name": "Fable"}} -> 'Fable'. Okänd form -> None."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if not isinstance(value, dict) or depth > 2:
+        return None
+    for field in SCOPE_NAME_FIELDS:
+        candidate = value.get(field)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    for inner in value.values():
+        found = scope_name(inner, depth + 1)
+        if found:
+            return found
+    return None
+
+
+def slugify(text: str) -> str:
+    """'OAuth-appar' -> 'oauth_appar'. Tom sträng om inget blir kvar."""
+    return re.sub(r"[^a-z0-9]+", "_", str(text).casefold()).strip("_")
+
+
+def list_entry_identity(item: dict, fallback: str):
+    """-> (nyckel, etikett|None). Etikett sätts bara när servern namngav posten.
+
+    Riktiga svar lägger de modellspecifika veckogränserna i en lista i stället
+    för som toppnycklar, så listor får inte ignoreras. Kan posten inte namnges
+    alls används fallback, så att den ändå renderas.
+    """
+    key = None
+    for field in LIST_KEY_FIELDS:
+        candidate = item.get(field)
+        if isinstance(candidate, str) and candidate.strip():
+            key = candidate.strip()
+            break
+
+    canonical = LIST_KIND_KEYS.get(key.casefold()) if key else None
+    name = scope_name(item.get("scope"))
+
+    if canonical is None:
+        # Okänt kodnamn: behåll det som nyckel, men låt en scope-post särskilja
+        # två poster som annars skulle kollidera på samma nyckel.
+        if key is None:
+            return fallback, None
+        if name:
+            suffix = slugify(name)
+            if suffix and suffix not in slugify(key).split("_"):
+                return "%s_%s" % (key, suffix), None
+        return key, None
+
+    if not name:
+        return canonical, None
+
+    suffix = slugify(name)
+    if not suffix:
+        return canonical, None
+    scoped_key = "%s_%s" % (canonical, suffix)
+    template = SCOPED_LABELS.get(canonical)
+    return scoped_key, (template % name) if template else None
 
 
 def list_entries(container_key: str, items):
-    """Plocka ut gränser ur en lista, t.ex. {"limits": [{...}, {...}]}.
-
-    Riktiga svar lägger de modellspecifika veckogränserna i en lista i stället
-    för som toppnycklar, så listor får inte ignoreras. Nyckeln hämtas från
-    första strängfältet som kan tänkas namnge posten; annars index.
-    """
+    """Plocka ut gränser ur en lista, t.ex. {"limits": [{...}, {...}]}."""
     found = []
     for index, item in enumerate(items):
         if not has_util_field(item):
             continue
-        key = None
-        for field in LIST_KEY_FIELDS:
-            candidate = item.get(field)
-            if isinstance(candidate, str) and candidate.strip():
-                key = candidate.strip()
-                break
-        if key is None:
-            key = "%s_%d" % (container_key, index)
-        found.append((key, item))
+        key, label = list_entry_identity(item, "%s_%d" % (container_key, index))
+        found.append((key, item, label))
     return found
+
+
+#: Reason-strängen för en toppnyckel utan värde (null). Stabil, jämförs mot i
+#: både render_text() och extension.js.
+EMPTY_REASON = "utan värde"
 
 
 def preview_scalar(value, width=40):
@@ -704,16 +790,20 @@ def format_scalar(value):
     return str(value)
 
 
-def build_limit(key: str, value: dict, now: float):
+def build_limit(key: str, value: dict, now: float, label=None):
     """Ett gränsobjekt -> normaliserad post. Används för både toppnycklar och
-    poster som låg i en lista."""
+    poster som låg i en lista.
+
+    `label` sätts när servern själv namngav posten (t.ex. scope.model
+    .display_name). Då är etiketten inte en gissning och märks inte med *.
+    """
     percent, util_field = pick_util(value)
     resets_epoch, resets_raw = pick_reset(value)
     window, suffix = parse_window(key)
     return {
         "key": key,
-        "label": humanize_key(key),
-        "known": key in KNOWN_LABELS,
+        "label": KNOWN_LABELS.get(key) or label or humanize_key(key),
+        "known": key in KNOWN_LABELS or label is not None,
         "percent": percent,
         "severity": severity(percent),
         "utilization_field": util_field,
@@ -784,9 +874,12 @@ def normalize(raw: dict, now: float):
                 continue
 
             if not isinstance(value, dict):
+                # null betyder i praktiken "gäller inte det här kontot". Ett
+                # riktigt svar har ett dussin sådana; de skiljs från riktiga
+                # skalärer så att de kan samlas på en rad i stället för elva.
                 unrecognized[key] = {
                     "key": key,
-                    "reason": "skalärt värde",
+                    "reason": EMPTY_REASON if value is None else "skalärt värde",
                     "value": preview_scalar(value),
                 }
                 continue
@@ -810,14 +903,14 @@ def normalize(raw: dict, now: float):
     have = {item["key"] for item in limits}
     for container_key, items in pending_lists:
         extracted = list_entries(container_key, items)
-        for key, item in extracted:
+        for key, item, label in extracted:
             if key in have:
                 continue
             if is_credit_key(key):
                 if credits is None:
                     credits = build_credits(key, item, now)
                 continue
-            limits.append(build_limit(key, item, now))
+            limits.append(build_limit(key, item, now, label))
             have.add(key)
             unrecognized.pop(key, None)
         if extracted:
@@ -1104,6 +1197,13 @@ def render_text(payload) -> str:
         lines.append("  * okänd nyckel — etiketten är autogenererad")
 
     unrecognized = payload.get("unrecognized") or []
+    # Tomma nycklar säger bara "gäller inte det här kontot" — en rad räcker.
+    empty = [item for item in unrecognized if item.get("reason") == EMPTY_REASON]
+    unrecognized = [item for item in unrecognized if item.get("reason") != EMPTY_REASON]
+    if empty:
+        lines.append(
+            "  Utan värde: %s" % ", ".join(item["key"] for item in empty)
+        )
     if unrecognized:
         lines.append("  Ej tolkade nycklar:")
         width = max(len(item["key"]) for item in unrecognized)

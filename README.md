@@ -107,9 +107,9 @@ tools/
   diagnose.sh               Samlar allt om varför tillägget inte syns.
 tests/
   run.sh                    Kör allt.
-  test_claude_usage.py      56 tester mot CLI:t via en lokal stubbserver.
+  test_claude_usage.py      62 tester mot CLI:t via en lokal stubbserver.
   js/
-    test_extension.mjs      38 tester mot extension.js.
+    test_extension.mjs      39 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
     loader.mjs              ESM-loader som mappar gi:// och resource:// till stubbarna.
     register.mjs            Registrerar loadern.
@@ -145,13 +145,25 @@ cd fedora-workstation-claude-usage
    `shell-version` gör att tillägget tyst inte laddas alls, utan felmeddelande.
 5. Aktiverar tillägget med `gnome-extensions enable`, med `gsettings` som
    reserv (Shell känner inte till tillägget förrän det startat om).
-6. Provkör `claude-usage --text` och visar resultatet.
+6. Provkör `claude-usage --text`, visar resultatet, och säger till om den
+   körande GNOME-sessionen startade före installationen — då återstår en
+   utloggning.
 
 Steg 5 kollar också `disable-user-extensions` och återställer den om den är
 `true` — den nyckeln slår annars ut alla användartillägg oavsett allt annat.
 
-**Logga sedan ut och in igen.** Wayland kan inte ladda om GNOME Shell live, så
-`Alt+F2` → `r` finns inte som genväg där. Utloggning är det som gäller.
+**Logga sedan ut och in igen:**
+
+```bash
+gnome-session-quit --logout
+```
+
+Det här steget går inte att hoppa över vid en förstagångsinstallation. GNOME
+Shell skannar tilläggskatalogen bara när Shell startar, så ett tillägg som lagts
+dit under en pågående session finns helt enkelt inte för den sessionen — och att
+köra `install.sh` igen ändrar ingenting. `install.sh` säger själv till om den
+körande sessionen är äldre än installationen. På Wayland finns dessutom ingen
+`Alt+F2` → `r`.
 
 Syns fortfarande inget i panelen efter utloggningen, kör `./tools/diagnose.sh` —
 se [Felsökning](#felsökning).
@@ -238,6 +250,12 @@ Parsern itererar över alla toppnycklar och klassar varje värde:
 | Gräns utan tolkbart tidsfönster | **Övrigt** — visas separat, räknas inte i panelen |
 | Objekt utan `utilization` | **Ej tolkad** — listas i popupen med sitt värde |
 | Skalärt värde | **Ej tolkad** — listas i popupen med sitt värde |
+| Värdet är `null` | **Utan värde** — alla samlas på en enda rad |
+
+Sista raden finns för att riktiga svar innehåller ett tiotal toppnycklar som
+bara är `null` (`tangelo`, `amber_ladder`, `seven_day_opus` …). De betyder i
+praktiken "gäller inte det här kontot". De tappas inte — de får `reason`
+`utan värde` i JSON:en — men de renderas som en rad, inte tio.
 
 Som `utilization` accepteras, i den ordningen: `utilization`, `utilisation`,
 `utilization_percent`, `percent_used`, `percent`. Värdet får vara heltal,
@@ -249,25 +267,52 @@ svar som `{"usage": {"five_hour": …}}` också fungerar.
 ### Gränser som ligger i en lista
 
 Riktiga svar lägger inte de modellspecifika veckogränserna som toppnycklar. Där
-är `seven_day_opus` och liknande **skalärer**, och de faktiska gränserna ligger i
-en lista:
+är `seven_day_opus` och liknande **skalärer** (oftast `null`), och de faktiska
+gränserna ligger i en lista. Så här ser ett verkligt svar ut:
 
 ```json
 {
-  "five_hour":      { "utilization": 78, "resets_at": "…" },
-  "seven_day":      { "utilization": 28, "resets_at": "…" },
-  "seven_day_opus": 0,
+  "five_hour":      { "utilization": 83, "resets_at": "…", "used_dollars": … },
+  "seven_day":      { "utilization": 29, "resets_at": "…" },
+  "seven_day_opus": null,
   "limits": [
-    { "type": "seven_day_opus",   "utilization": 12, "resets_at": "…" },
-    { "type": "seven_day_sonnet", "utilization": 41, "resets_at": "…" }
+    { "kind": "session",       "percent": 83, "scope": null,  "resets_at": "…" },
+    { "kind": "weekly_all",    "percent": 29, "scope": null,  "resets_at": "…" },
+    { "kind": "weekly_scoped", "percent": 55, "resets_at": "…",
+      "scope": { "model": { "display_name": "Fable", "id": null } } }
   ]
 }
 ```
 
-Därför gås listor igenom också. Varje post som har ett `utilization`-fält blir en
-gräns, och nyckeln hämtas från första strängfältet som kan namnge posten:
-`type`, `limit_type`, `key`, `name`, `id`, `window`, `scope`, `period`. Saknas
-alla blir nyckeln `listnamn_index`, så posten renderas ändå.
+Därför gås listor igenom också. Varje post som har ett `utilization`-fält (eller
+`percent`) blir en gräns, och nyckeln hämtas från första strängfältet som kan
+namnge posten: `kind`, `type`, `limit_type`, `key`, `name`, `id`, `window`,
+`group`, `scope`, `period`. Saknas alla blir nyckeln `listnamn_index`, så posten
+renderas ändå.
+
+**Kodnamnen översätts till toppnivåns nycklar.** `kind` är listans eget namn på
+tidsfönstret, inte samma som toppnyckeln:
+
+| `kind` | Blir nyckeln |
+| --- | --- |
+| `session`, `five_hour` | `five_hour` |
+| `weekly`, `weekly_all`, `weekly_scoped` | `seven_day` |
+| `daily` | `one_day` |
+| `monthly` | `thirty_day` |
+
+Utan den översättningen blir posterna `limits_0`, `limits_1`, `limits_2`: två
+rena dubbletter av `five_hour` och `seven_day`, och en riktig veckogräns som
+tappar sitt tidsfönster, hamnar under "Övrigt" och inte räknas i panelen.
+
+**Scope ger namnet.** En `weekly_scoped`-post är begränsad till en modell, och
+namnet ligger nästlat. Parsern letar `display_name`, `name`, `label`, `title`,
+`id` — först direkt i `scope`, sedan ett par nivåer ned. Träffen ger både
+nyckelns suffix och etiketten: `scope.model.display_name = "Fable"` blir
+nyckeln `seven_day_fable` och etiketten **Vecka – Fable**. Eftersom namnet kommer
+från servern och inte från en gissning märks raden *inte* med `*`.
+
+Två poster med samma `kind` men olika scope får därmed skilda nycklar och
+krockar inte.
 
 Ordningen är avsiktlig: **toppnycklar först, listor sedan.** En gräns ur listan
 får komplettera en toppnyckel som bara var en skalär, utan att det blir
@@ -320,6 +365,7 @@ autogenererat namn och märks med `*` i popupen:
 | `seven_day_cowork` | Vecka – Cowork |
 | `seven_day_oauth_apps` | Vecka – OAuth-appar |
 | `extra_usage` | Credits *(renderas sist)* |
+| listpost med `scope.model.display_name` | `Vecka – Fable` *(namnet från servern)* |
 | `thirty_day_fable` | `30 dagar – Fable` *(autogenererad)* |
 | `helt_okänd_nyckel` | `Helt okänd nyckel` *(autogenererad)* |
 
@@ -362,12 +408,17 @@ Utdatalägena är ömsesidigt uteslutande.
 
 ```
 $ claude-usage --text
-Claude usage · uppdaterad 12 s sedan
-  Session (5 h)            42 %  ████████░░░░░░░░░░░░  återställs om 2 h 13 min
-  Vecka – alla modeller    67 %  █████████████░░░░░░░  återställs om 3 d 11 h
-  Vecka – Cowork            0 %  ░░░░░░░░░░░░░░░░░░░░  återställs om 3 d 11 h
-  Vecka – Opus           93.5 %  ███████████████████░  återställs om 3 d 11 h
-  Credits                Used credits: 1.5 · Credit limit: 25 · Enabled: ja
+Claude usage · uppdaterad just nu
+  Session (5 h)          85 %  █████████████████░░░  återställs om 24 min
+  Vecka – alla modeller  29 %  ██████░░░░░░░░░░░░░░  återställs om 6 d 8 h
+  Vecka – Fable          55 %  ███████████░░░░░░░░░  återställs om 6 d 8 h
+  Credits                 0 %  ░░░░░░░░░░░░░░░░░░░░  0,00 / 85,00 EUR
+    Disabled reason: out_of_credits · Is enabled: nej
+  Övrigt (ingen känd tidsgräns — räknas inte i panelen):
+    Nimbus quill *          0 %  ░░░░░░░░░░░░░░░░░░░░
+    Spend *                 0 %  ░░░░░░░░░░░░░░░░░░░░
+  * okänd nyckel — etiketten är autogenererad
+  Utan värde: amber_ladder, cinder_cove, seven_day_opus, tangelo, …
   Endpointen är odokumenterad och kan ändras utan förvarning.
 ```
 
@@ -635,12 +686,38 @@ journalctl -f -o cat /usr/bin/gnome-shell
 Fyra orsaker står för nästan alla fall. `diagnose.sh` skiljer dem åt, men
 i korthet:
 
-**1. Du har inte loggat ut och in igen.** Wayland kan inte ladda om GNOME Shell
-live. Kontrollera att Shell känner till tillägget alls:
+**1. Du har inte loggat ut och in igen.** Det här är den överlägset vanligaste
+orsaken, och den enda som `install.sh` inte kan åtgärda åt dig.
+
+GNOME Shell läser tilläggskatalogen **en enda gång, när Shell startar**
+(`_loadExtensions()` i `extensionSystem.js`). Det finns ingen katalogbevakning:
+enda vägen in i en körande session är nedladdning från extensions.gnome.org, som
+inte gäller ett lokalt installerat tillägg. Ett tillägg som lagts på plats under
+en pågående session existerar därför helt enkelt inte för Shell — oavsett hur
+rätt filer, `shell-version` och dconf-nycklar är.
+
+Praktiska följder:
+
+- Att köra `./install.sh` igen ändrar ingenting. Det är inte fel på
+  installationen; sessionen är bara äldre än den.
+- `gnome-extensions enable` misslyckas med *"Tillägget … finns inte"* före
+  första utloggningen. Det är väntat — `install.sh` skriver då dconf-nyckeln
+  direkt i stället, så tillägget är aktiverat när nästa session startar.
+- På Wayland finns ingen `Alt+F2` → `r`. Utloggning är det som gäller.
+
+```bash
+gnome-session-quit --logout
+```
+
+Kontrollera efteråt att Shell känner till tillägget:
 
 ```bash
 gnome-extensions list --user | grep claude-usage
 ```
+
+`tools/diagnose.sh` skiljer det här fallet från ett riktigt fel: den jämför
+gnome-shell-processens starttid med installationens tidsstämpel och
+rapporterar "väntar på utloggning" i stället för ett problem.
 
 **2. Alla användartillägg är avstängda.** En enda dconf-nyckel slår ut allt,
 oavsett vad `enabled-extensions` säger:
@@ -722,15 +799,24 @@ claude-usage --force --text
 Ärligt redovisat, inklusive det som inte gått att verifiera:
 
 - **Skalärerna på toppnivån är fortfarande otolkade.** Ett riktigt svar har
-  `seven_day_cowork: 0`, `tangelo: 0`, `amber_ladder: 0` med flera som bara
-  siffror. Vad de betyder är okänt — de listas med sitt värde under "Ej tolkade
-  nycklar" i `--text` och i `unrecognized` i `--json`, men renderas inte som
-  gränser eftersom en naken siffra inte går att skilja från en flagga.
+  `seven_day_cowork`, `tangelo`, `amber_ladder` med flera som nakna värden — i
+  praktiken alltid `null`. Vad de betyder är okänt. De som är `null` samlas på
+  raden "Utan värde"; de som har ett faktiskt värde listas under "Ej tolkade
+  nycklar" med värdet. Ingen av dem renderas som gräns, eftersom en naken siffra
+  inte går att skilja från en flagga.
 - **Interna kodnamn hamnar under "Övrigt".** `nimbus_quill` och `spend` har
   `utilization` men inget tidsfönster. Vad de mäter är okänt, så de visas men
-  räknas inte i panelen.
+  räknas inte i panelen. (`nimbus_quill` har till och med `resets_at` och samma
+  dollar-fält som `five_hour`, men kriteriet är nyckelns form — ett okänt
+  kodnamn ska inte kunna färga panelen röd.)
+- **Dollar-fälten används inte.** `five_hour` och `seven_day` innehåller
+  `used_dollars`, `limit_dollars` och `remaining_dollars`. Bara `utilization`
+  visas; beloppen finns i `--raw`.
 - **Grafiken är inte sedd på en körande GNOME.** Mått och färger är valda utifrån
-  Adwaitas palett och St:s begränsningar, inte utifrån en skärmdump.
+  Adwaitas palett och St:s begränsningar, inte utifrån en skärmdump. API-anropen
+  är däremot avstämda mot källkoden i GNOME Shell 50 (`panelMenu.js` använder
+  fortfarande `_init`, `addToStatusArea(role, indicator, position, box)` är
+  oförändrad, och `St.BoxLayout` har kvar både `orientation` och `vertical`).
 - **`-st-accent-color` är inte verifierad** och därför inte påslagen. Standardblå
   `#3584e4` är Fedora Workstations standardaccent, så stock-utseendet stämmer.
 - **Endpointen är blockerad från datacenter-IP:n.** Cloudflare svarar `403` med
@@ -748,14 +834,14 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (56 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (62 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,
 HTML-svar, 401, utgången token och saknad credentials-fil alla ger cachad data
 eller ett läsbart fel — och att token aldrig läcker i något utdataläge.
 
-**JS-testerna (38 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
+**JS-testerna (39 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
 ESM-loader som mappar `gi://` och `resource://` till `tests/js/stubs.mjs`. De
 verifierar panel, stapelbredder, nedräkningar, felläge, placering i mittboxen
 och att `disable()` städar timers, vakthund och signalhandlers. Stubbarna är

@@ -39,6 +39,9 @@ const PANEL_POSITION = 1;
  * hårdkodad grå färg skulle se fel ut i antingen ljust eller mörkt tema. */
 const DIM_OPACITY = 145;
 
+/** Måste matcha EMPTY_REASON i bin/claude-usage — nyckel utan värde i svaret. */
+const EMPTY_REASON = 'utan värde';
+
 const SEVERITY_CLASS = {
     ok: 'claude-usage-ok',
     warn: 'claude-usage-warn',
@@ -554,9 +557,20 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             if ([...limits, ...extras].some(item => item.known === false))
                 notes.push('* okänd nyckel — etiketten är autogenererad');
             const unrecognized = payload.unrecognized ?? [];
-            if (unrecognized.length) {
+            // Tomma nycklar betyder "gäller inte det här kontot". Ett riktigt
+            // svar har ett tiotal; de samlas på en rad i stället för att fylla
+            // popupen med brus.
+            const empty = unrecognized.filter(
+                entry => entry.reason === EMPTY_REASON);
+            const unparsed = unrecognized.filter(
+                entry => entry.reason !== EMPTY_REASON);
+            if (empty.length) {
+                notes.push(`Utan värde: ${
+                    empty.map(entry => entry.key).join(', ')}`);
+            }
+            if (unparsed.length) {
                 notes.push(`Ej tolkade nycklar: ${
-                    unrecognized.map(entry => entry.key).join(', ')}`);
+                    unparsed.map(entry => entry.key).join(', ')}`);
             }
             for (const note of notes)
                 this.menu.addMenuItem(this._makeInfoItem(note, 'claude-usage-note'));
