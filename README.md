@@ -107,9 +107,9 @@ tools/
   diagnose.sh               Samlar allt om varför tillägget inte syns.
 tests/
   run.sh                    Kör allt.
-  test_claude_usage.py      53 tester mot CLI:t via en lokal stubbserver.
+  test_claude_usage.py      56 tester mot CLI:t via en lokal stubbserver.
   js/
-    test_extension.mjs      36 tester mot extension.js.
+    test_extension.mjs      38 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
     loader.mjs              ESM-loader som mappar gi:// och resource:// till stubbarna.
     register.mjs            Registrerar loadern.
@@ -235,6 +235,7 @@ Parsern itererar över alla toppnycklar och klassar varje värde:
 | Objekt med ett `utilization`-fält | **Gräns** — egen rad med stapel |
 | Nyckeln är `extra_usage` eller innehåller `credit` | **Credits** — renderas sist |
 | Lista med objekt som har `utilization` | **Gränser** — en rad per post |
+| Gräns utan tolkbart tidsfönster | **Övrigt** — visas separat, räknas inte i panelen |
 | Objekt utan `utilization` | **Ej tolkad** — listas i popupen med sitt värde |
 | Skalärt värde | **Ej tolkad** — listas i popupen med sitt värde |
 
@@ -273,6 +274,25 @@ får komplettera en toppnyckel som bara var en skalär, utan att det blir
 dubbletter — skalären försvinner då ur "ej tolkade nycklar". En lista som inte
 innehåller några gränser rapporteras som `lista utan gränser` i stället för att
 tigande försvinna.
+
+### Gränser kontra "Övrigt"
+
+Ett riktigt svar innehåller objekt med `utilization` vars nycklar är interna
+kodnamn — `nimbus_quill`, `spend`, `tangelo` — som inte motsvarar något i
+Claude-appens Usage-vy. De får inte tappas, men de hör inte heller bland dina
+faktiska gränser, och framför allt ska de **inte driva panelens procentsiffra**:
+en okänd nyckel på 99 % får inte färga panelen röd.
+
+Skiljelinjen är nyckelns *form*, inte en lista med namn:
+
+| | Hamnar i | Driver panelen |
+| --- | --- | --- |
+| Tolkbart tidsfönster (`five_hour`, `seven_day_opus`, `thirty_day_x`) | `limits` | Ja |
+| Inget tidsfönster (`nimbus_quill`, `spend`, `limits_0`) | `extras` | Nej |
+
+Eftersom kriteriet är formen hanteras nya kodnamn automatiskt. I popupen ligger
+`extras` under en egen rubrik, *"Övrigt — ingen känd tidsgräns, räknas inte i
+panelen"*, efter credits.
 
 ### Ordning
 
@@ -382,7 +402,7 @@ tillägget. `schema` räknas upp om formen bryts.
 
 | Fält | Typ | Betydelse |
 | --- | --- | --- |
-| `schema` | int | Versionen på det här formatet, just nu `1` |
+| `schema` | int | Versionen på det här formatet, just nu `2` |
 | `ok` | bool | Om det finns siffror att visa, färska eller cachade |
 | `stale` | bool | Sant vid fel, eller om datan är äldre än 300 s |
 | `source` | `"network"` \| `"cache"` | Om ett riktigt anrop gjordes och lyckades |
@@ -390,10 +410,11 @@ tillägget. `schema` räknas upp om formen bryts.
 | `fetched_at` | float \| null | Epoch när datan senast hämtades |
 | `age_seconds` | int \| null | Datans ålder |
 | `error` | objekt \| null | Se nedan |
-| `limits` | lista | En post per gräns, sorterad |
+| `limits` | lista | En post per tidsfönstrad gräns, sorterad |
+| `extras` | lista | Samma form, för nycklar utan tidsfönster. Räknas inte i `max_percent`. |
 | `credits` | objekt \| null | Credits-raden |
 | `unrecognized` | lista | `{key, reason, value}` för nycklar som inte tolkades |
-| `max_percent` | float \| null | Högsta procenten bland gränserna |
+| `max_percent` | float \| null | Högsta procenten bland `limits` — **inte** `extras` |
 | `max_severity` | sträng | `ok`, `warn`, `crit` eller `unknown` |
 | `endpoint_documented` | bool | Alltid `false`. En påminnelse. |
 
@@ -422,15 +443,22 @@ Samma fält som en gräns, plus två listor av `{key, label, value}`:
 
 | Fält | Innehåll |
 | --- | --- |
-| `fields` | **Alla** skalära fält i objektet, orört |
+| `amount_summary` | Beloppsrad, t.ex. `"0,00 / 85,00 EUR"`, eller `null` |
+| `fields` | **Alla** skalära fält, med belopp formaterade |
 | `display_fields` | Den kurerade delmängden som visas — högst 4 |
 
 Riktiga svar har ett dussin fält (`currency`, `decimal_places`,
 `disabled_reason`, `credits_ever_enabled`, `spend_limit_reached` …). Alla på en
 rad blir en oläslig vägg, så `display_fields` väljer i prioritetsordning:
 `used_credits`, `monthly_limit`, `currency`, `disabled_reason`, `is_enabled`.
-`utilization` utesluts medvetet — den visas redan som procent i egen kolumn.
-Allt finns kvar i `fields` och i `--raw`.
+`utilization` utesluts medvetet — den visas redan som procent i egen kolumn, och
+fält som redan står i `amount_summary` upprepas inte. Allt finns kvar i `fields`
+och i `--raw`.
+
+**Belopp.** Är `currency` och `decimal_places` båda satta tolkas penningfält som
+minsta valutaenhet: `monthly_limit: 8500` med `decimal_places: 2` blir
+`85,00 EUR`. Det är bekräftat mot ett riktigt konto. Saknas metadatan lämnas
+talet orört — hellre ett rått tal än en omräkning med faktor 100 fel.
 
 ### `error.kind`
 
@@ -693,15 +721,14 @@ claude-usage --force --text
 
 Ärligt redovisat, inklusive det som inte gått att verifiera:
 
-- **Beloppen i credits visas orörda.** Ett riktigt svar innehåller
-  `monthly_limit: 8500` tillsammans med `currency: EUR` och `decimal_places: 2`,
-  vilket sannolikt betyder 85,00 €. Skriptet räknar inte om det, eftersom en
-  felaktig omräkning med faktor 100 är värre än ett rått tal. Jämför med
-  Claude-appens Usage-vy.
-- **Nycklar som bara är interna kodnamn visas också.** Ett riktigt svar innehåller
-  objekt som `nimbus_quill` och `spend` med `utilization: 0`. De renderas med
-  autogenererad etikett och `*`, eftersom specen säger att inget får tappas — men
-  de är brus. Vill du dölja dem, filtrera på nyckel i `normalize()`.
+- **Skalärerna på toppnivån är fortfarande otolkade.** Ett riktigt svar har
+  `seven_day_cowork: 0`, `tangelo: 0`, `amber_ladder: 0` med flera som bara
+  siffror. Vad de betyder är okänt — de listas med sitt värde under "Ej tolkade
+  nycklar" i `--text` och i `unrecognized` i `--json`, men renderas inte som
+  gränser eftersom en naken siffra inte går att skilja från en flagga.
+- **Interna kodnamn hamnar under "Övrigt".** `nimbus_quill` och `spend` har
+  `utilization` men inget tidsfönster. Vad de mäter är okänt, så de visas men
+  räknas inte i panelen.
 - **Grafiken är inte sedd på en körande GNOME.** Mått och färger är valda utifrån
   Adwaitas palett och St:s begränsningar, inte utifrån en skärmdump.
 - **`-st-accent-color` är inte verifierad** och därför inte påslagen. Standardblå
@@ -721,14 +748,14 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (53 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (56 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,
 HTML-svar, 401, utgången token och saknad credentials-fil alla ger cachad data
 eller ett läsbart fel — och att token aldrig läcker i något utdataläge.
 
-**JS-testerna (36 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
+**JS-testerna (38 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
 ESM-loader som mappar `gi://` och `resource://` till `tests/js/stubs.mjs`. De
 verifierar panel, stapelbredder, nedräkningar, felläge, placering i mittboxen
 och att `disable()` städar timers, vakthund och signalhandlers. Stubbarna är

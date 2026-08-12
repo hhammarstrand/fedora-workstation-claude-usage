@@ -62,11 +62,16 @@ function payload(overrides = {}) {
             label: 'Credits',
             percent: null,
             severity: 'unknown',
+            amount_summary: '0,00 / 85,00 EUR',
             fields: [
-                {key: 'used_credits', label: 'Used credits', value: '1.5'},
-                {key: 'credit_limit', label: 'Credit limit', value: '25'},
+                {key: 'used_credits', label: 'Used credits', value: '0,00 EUR'},
+                {key: 'disabled_reason', label: 'Disabled reason', value: 'out_of_credits'},
+            ],
+            display_fields: [
+                {key: 'disabled_reason', label: 'Disabled reason', value: 'out_of_credits'},
             ],
         },
+        extras: [],
         unrecognized: [],
         max_percent: 93.5,
         max_severity: 'crit',
@@ -226,7 +231,9 @@ test('popupen får en rad per gräns, credits sist, plus Uppdatera nu', async ()
     assert.ok(all.some(text => text === '42 %'));
     assert.ok(all.some(text => text === '93.5 %'));
     assert.ok(all.some(text => text.includes('återställs om 2 h')));
-    assert.ok(all.some(text => text.includes('Used credits: 1.5 · Credit limit: 25')));
+    assert.ok(all.some(text => text === '0,00 / 85,00 EUR'), 'beloppen i rubriken');
+    assert.ok(all.some(text => text.includes('Disabled reason: out_of_credits')));
+    assert.ok(!all.some(text => text.includes('decimal_places')), 'ingen fältvägg');
     assert.equal(all.at(-1), 'Uppdatera nu', 'sista posten ska vara Uppdatera nu');
 
     // Credits ska ligga efter alla gränsrader.
@@ -234,6 +241,36 @@ test('popupen får en rad per gräns, credits sist, plus Uppdatera nu', async ()
     const opusIndex = all.findIndex(text => text.includes('Vecka – Opus'));
     assert.ok(creditsIndex > opusIndex, 'credits-raden ska ligga sist av raderna');
 
+    indicator.destroy();
+});
+
+test('extras hamnar under en egen rubrik och driver inte panelen', async () => {
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 10, 'ok')],
+        extras: [limit('nimbus_quill', 'Nimbus quill', 99, 'crit', {known: false})],
+        credits: null,
+        // Skriptet räknar max_percent utan extras — panelen ska följa det.
+        max_percent: 10,
+        max_severity: 'ok',
+    }));
+
+    assert.equal(indicator._panelLabel.text, '10 %', 'extras får inte höja siffran');
+    assert.match(indicator._dot.style_class, /claude-usage-ok/,
+        'en okänd nyckel på 99 % får inte färga panelen röd');
+
+    const all = menuTexts(indicator);
+    assert.ok(all.some(text => text.includes('Övrigt')), 'egen rubrik');
+    assert.ok(all.some(text => text === 'Nimbus quill *'), 'men visas');
+    assert.ok(all.some(text => text.includes('autogenererad')));
+    // Rubriken ska stå före raden.
+    const heading = all.findIndex(text => text.includes('Övrigt'));
+    assert.ok(heading < all.findIndex(text => text === 'Nimbus quill *'));
+    indicator.destroy();
+});
+
+test('inga extras ger ingen tom Övrigt-rubrik', async () => {
+    const indicator = await build();
+    assert.ok(!menuTexts(indicator).some(text => text.includes('Övrigt')));
     indicator.destroy();
 });
 

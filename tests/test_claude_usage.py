@@ -179,7 +179,7 @@ class TestHappyPath(UsageTestCase):
         self.assertFalse(payload["endpoint_documented"])
 
         keys = [limit["key"] for limit in payload["limits"]]
-        # Alla sex utilization-nycklar med — credits ligger separat.
+        # Tidsfönstrade gränser i limits; credits och fönsterlösa nycklar separat.
         self.assertCountEqual(
             keys,
             [
@@ -188,15 +188,16 @@ class TestHappyPath(UsageTestCase):
                 "seven_day_opus",
                 "seven_day_cowork",
                 "thirty_day_fable",
-                "wibble_frotz",
             ],
         )
         # Sortering: kortaste fönstret först, generell före modellspecifik.
         self.assertEqual(keys[0], "five_hour")
         self.assertEqual(keys[1], "seven_day")
         self.assertLess(keys.index("seven_day"), keys.index("seven_day_opus"))
-        # Okänd nyckel utan fönster hamnar sist, inte bortkastad.
-        self.assertEqual(keys[-1], "wibble_frotz")
+        # wibble_frotz har inget tolkbart tidsfönster -> extras, inte bortkastad.
+        self.assertEqual(
+            [item["key"] for item in payload["extras"]], ["wibble_frotz"]
+        )
 
     def test_headers_sent(self):
         self.serve(ok_json)
@@ -209,7 +210,8 @@ class TestHappyPath(UsageTestCase):
     def test_labels_for_known_and_unknown_keys(self):
         self.serve(ok_json)
         payload, _ = self.run_json("--force")
-        labels = {limit["key"]: limit["label"] for limit in payload["limits"]}
+        every = payload["limits"] + payload["extras"]
+        labels = {item["key"]: item["label"] for item in every}
 
         self.assertEqual(labels["five_hour"], "Session (5 h)")
         self.assertEqual(labels["seven_day"], "Vecka – alla modeller")
@@ -220,7 +222,7 @@ class TestHappyPath(UsageTestCase):
         for label in labels.values():
             self.assertTrue(label.strip())
 
-        known = {limit["key"]: limit["known"] for limit in payload["limits"]}
+        known = {item["key"]: item["known"] for item in every}
         self.assertTrue(known["five_hour"])
         self.assertFalse(known["thirty_day_fable"])
 
@@ -243,10 +245,10 @@ class TestHappyPath(UsageTestCase):
                 "application/json",
                 json.dumps(
                     {
-                        "a_five_minute": {"utilization": 69.9},
-                        "b_five_minute": {"utilization": 70},
-                        "c_five_minute": {"utilization": 89.9},
-                        "d_five_minute": {"utilization": 90},
+                        "five_minute": {"utilization": 69.9},
+                        "six_minute": {"utilization": 70},
+                        "seven_minute": {"utilization": 89.9},
+                        "eight_minute": {"utilization": 90},
                     }
                 ),
             )
@@ -254,15 +256,17 @@ class TestHappyPath(UsageTestCase):
         self.serve(responder)
         payload, _ = self.run_json("--force")
         got = {limit["key"]: limit["severity"] for limit in payload["limits"]}
-        self.assertEqual(got["a_five_minute"], "ok")
-        self.assertEqual(got["b_five_minute"], "warn")
-        self.assertEqual(got["c_five_minute"], "warn")
-        self.assertEqual(got["d_five_minute"], "crit")
+        self.assertEqual(got["five_minute"], "ok")
+        self.assertEqual(got["six_minute"], "warn")
+        self.assertEqual(got["seven_minute"], "warn")
+        self.assertEqual(got["eight_minute"], "crit")
 
     def test_resets_at_formats(self):
         self.serve(ok_json)
         payload, _ = self.run_json("--force")
-        by_key = {limit["key"]: limit for limit in payload["limits"]}
+        by_key = {
+            item["key"]: item for item in payload["limits"] + payload["extras"]
+        }
 
         # ISO med Z, ISO med offset och epoch-sekunder ska alla ge en epoch.
         # 1786485600 == 2026-08-11T22:00:00Z
@@ -469,18 +473,90 @@ class TestRealWorldShape(UsageTestCase):
 
         display = [field["key"] for field in credits["display_fields"]]
         self.assertLessEqual(len(display), 4, "credits-raden får inte bli en vägg")
-        self.assertEqual(display[0], "used_credits", "viktigast först")
-        self.assertIn("monthly_limit", display)
+        # Beloppen visas i amount_summary, så de upprepas inte här.
+        self.assertIn("disabled_reason", display)
         self.assertNotIn("decimal_places", display)
         self.assertNotIn("credits_ever_enabled", display)
+        self.assertNotIn("utilization", display, "dubblerar procentkolumnen")
 
-    def test_unknown_object_keys_still_render(self):
+    def test_keys_without_a_time_window_go_to_extras(self):
+        """nimbus_quill och spend är interna kodnamn utan tidsfönster."""
         self.serve_shape()
         payload, _ = self.run_json("--force")
-        by_key = {limit["key"]: limit for limit in payload["limits"]}
-        self.assertIn("nimbus_quill", by_key)
+
+        limit_keys = {limit["key"] for limit in payload["limits"]}
+        extra_keys = {item["key"] for item in payload["extras"]}
+
+        self.assertNotIn("nimbus_quill", limit_keys, "hör inte bland gränserna")
+        self.assertIn("nimbus_quill", extra_keys, "men får inte tappas")
+        by_key = {item["key"]: item for item in payload["extras"]}
         self.assertEqual(by_key["nimbus_quill"]["label"], "Nimbus quill")
         self.assertFalse(by_key["nimbus_quill"]["known"])
+        # Alla tidsfönstrade gränser ligger kvar i limits.
+        self.assertIn("five_hour", limit_keys)
+        self.assertIn("seven_day_opus", limit_keys)
+
+    def test_extras_do_not_drive_the_panel_percentage(self):
+        """En okänd nyckel på 99 % får inte färga panelen röd."""
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "five_hour": {"utilization": 10},
+                        "mystery_codename": {"utilization": 99},
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertAlmostEqual(payload["max_percent"], 10.0)
+        self.assertEqual(payload["max_severity"], "ok")
+        self.assertEqual(
+            [item["key"] for item in payload["extras"]], ["mystery_codename"]
+        )
+
+    def test_credit_amounts_are_formatted_from_minor_units(self):
+        """Bekräftat mot verklig data: 8500 med decimal_places 2 = 85,00 EUR."""
+        self.serve_shape()
+        payload, _ = self.run_json("--force")
+        credits = payload["credits"]
+
+        self.assertEqual(credits["amount_summary"], "0,00 / 85,00 EUR")
+        # Fältlistan visar också belopp, inte råa heltal.
+        by_key = {field["key"]: field["value"] for field in credits["fields"]}
+        self.assertEqual(by_key["monthly_limit"], "85,00 EUR")
+        self.assertEqual(by_key["used_credits"], "0,00 EUR")
+        # Icke-belopp rörs inte.
+        self.assertEqual(by_key["decimal_places"], "2")
+        self.assertEqual(by_key["credits_ever_enabled"], "ja")
+        # Fälten som gick in i beloppsraden upprepas inte.
+        display = [field["key"] for field in credits["display_fields"]]
+        self.assertNotIn("monthly_limit", display)
+        self.assertNotIn("used_credits", display)
+        self.assertNotIn("currency", display)
+
+    def test_amounts_are_left_alone_without_currency_metadata(self):
+        def responder(_n):
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "five_hour": {"utilization": 1},
+                        "extra_usage": {"monthly_limit": 8500, "used_credits": 0},
+                    }
+                ),
+            )
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        credits = payload["credits"]
+        self.assertIsNone(credits["amount_summary"], "gissa inte utan currency")
+        by_key = {field["key"]: field["value"] for field in credits["fields"]}
+        self.assertEqual(by_key["monthly_limit"], "8500")
 
     def test_text_output_stays_readable(self):
         self.serve_shape()
@@ -490,6 +566,9 @@ class TestRealWorldShape(UsageTestCase):
 
         self.assertIn("Vecka – Opus", out)
         self.assertIn("Vecka – Sonnet", out)
+        self.assertIn("0,00 / 85,00 EUR", out)
+        self.assertIn("Övrigt", out)
+        self.assertIn("Nimbus quill", out)
         # Ingen rad får bli absurt lång.
         longest = max(len(line) for line in out.splitlines())
         self.assertLess(longest, 120, "en rad blev för lång:\n%s" % out)
@@ -523,10 +602,11 @@ class TestRealWorldShape(UsageTestCase):
 
         self.serve(responder)
         payload, _ = self.run_json("--force")
-        keys = [limit["key"] for limit in payload["limits"]]
+        # Utan namnfält finns inget tidsfönster att tolka -> extras.
+        keys = [item["key"] for item in payload["extras"]]
         self.assertEqual(keys, ["limits_0", "limits_1"])
-        for limit in payload["limits"]:
-            self.assertTrue(limit["label"].strip())
+        for item in payload["extras"]:
+            self.assertTrue(item["label"].strip())
 
 
 class TestCaching(UsageTestCase):

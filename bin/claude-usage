@@ -58,7 +58,7 @@ STALE_AFTER = 300.0
 
 HTTP_TIMEOUT = 10.0
 MAX_BODY = 2_000_000
-SCHEMA = 1
+SCHEMA = 2  # 2: limits delas i limits + extras, credits får belopp
 
 OK_AT, WARN_AT, CRIT_AT = 0.0, 70.0, 90.0
 
@@ -566,6 +566,74 @@ def preview_scalar(value, width=40):
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+#: Nyckelmönster som betyder att ett numeriskt värde är ett belopp. Bekräftat
+#: mot verklig data: monthly_limit 8500 med currency EUR och decimal_places 2
+#: betyder 85,00 EUR — beloppen är alltså i minsta valutaenhet.
+MONEY_KEY_PATTERNS = ("credit", "spend", "balance", "amount", "cost")
+MONEY_KEY_DENY = ("decimal_places", "utilization", "utilisation", "percent")
+
+USED_FIELDS = ("used_credits", "credits_used", "used", "spent")
+LIMIT_FIELDS = ("monthly_limit", "credit_limit", "spend_limit", "limit")
+
+
+def is_money_key(key: str) -> bool:
+    lowered = key.lower()
+    if lowered in MONEY_KEY_DENY:
+        return False
+    if lowered == "limit" or lowered.endswith("_limit"):
+        return True
+    return any(pattern in lowered for pattern in MONEY_KEY_PATTERNS)
+
+
+def format_money(minor_units, currency, decimals, with_currency=True) -> str:
+    """8500, 'EUR', 2 -> '85,00 EUR'. Svenskt decimalkomma."""
+    try:
+        value = float(minor_units) / (10 ** int(decimals))
+    except (TypeError, ValueError, OverflowError):
+        return format_scalar(minor_units)
+    text = ("%.*f" % (max(int(decimals), 0), value)).replace(".", ",")
+    return "%s %s" % (text, currency) if with_currency else text
+
+
+def pick_numeric(entry: dict, fields):
+    for field in fields:
+        value = entry.get(field)
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return field, value
+    return None, None
+
+
+def credit_amounts(entry: dict):
+    """-> (summary|None, konsumerade nycklar). Kräver currency + decimal_places."""
+    currency = entry.get("currency")
+    decimals = entry.get("decimal_places")
+    if not isinstance(currency, str) or not currency.strip():
+        return None, set()
+    if isinstance(decimals, bool) or not isinstance(decimals, int):
+        return None, set()
+
+    used_key, used = pick_numeric(entry, USED_FIELDS)
+    limit_key, limit = pick_numeric(entry, LIMIT_FIELDS)
+    consumed = {key for key in (used_key, limit_key, "currency", "decimal_places") if key}
+
+    if used is not None and limit is not None:
+        return (
+            "%s / %s"
+            % (
+                format_money(used, currency, decimals, with_currency=False),
+                format_money(limit, currency, decimals),
+            ),
+            consumed,
+        )
+    if limit is not None:
+        return "max %s" % format_money(limit, currency, decimals), consumed
+    if used is not None:
+        return format_money(used, currency, decimals), consumed
+    return None, set()
+
+
 #: Fält som är värda att visa i credits-raden, i den ordningen. Riktiga svar
 #: innehåller ett dussin fält — currency, decimal_places, disabled_reason,
 #: credits_ever_enabled … — och alla på en rad blir en oläslig vägg. Allt finns
@@ -585,12 +653,15 @@ CREDIT_DISPLAY_SKIP = ("utilization", "utilisation", "percent")
 MAX_CREDIT_DISPLAY_FIELDS = 4
 
 
-def display_credit_fields(fields):
-    """Välj ut de intressanta credits-fälten, i prioritetsordning."""
+def display_credit_fields(fields, consumed=()):
+    """Välj ut de intressanta credits-fälten, i prioritetsordning.
+
+    `consumed` är nycklar som redan visas i beloppsraden och därför inte ska
+    upprepas.
+    """
+    skip = set(CREDIT_DISPLAY_SKIP) | set(consumed)
     by_key = {
-        field["key"]: field
-        for field in fields
-        if field["key"] not in CREDIT_DISPLAY_SKIP
+        field["key"]: field for field in fields if field["key"] not in skip
     }
     chosen = []
     for key in CREDIT_DISPLAY_PRIORITY:
@@ -658,6 +729,19 @@ def build_credits(key: str, value: dict, now: float):
     percent, _ = pick_util(value)
     resets_epoch, resets_raw = pick_reset(value)
     fields = credit_fields(value)
+    amount_summary, consumed = credit_amounts(value)
+
+    # Formatera penningbelopp även i fältlistan, så att 8500 inte visas rått.
+    currency = value.get("currency")
+    decimals = value.get("decimal_places")
+    if isinstance(currency, str) and isinstance(decimals, int) \
+            and not isinstance(decimals, bool):
+        for field in fields:
+            raw = value.get(field["key"])
+            if is_money_key(field["key"]) and isinstance(raw, (int, float)) \
+                    and not isinstance(raw, bool):
+                field["value"] = format_money(raw, currency, decimals)
+
     return {
         "key": key,
         "label": humanize_key(key),
@@ -666,8 +750,9 @@ def build_credits(key: str, value: dict, now: float):
         "resets_at_epoch": resets_epoch,
         "resets_at": resets_raw,
         "resets_in_seconds": None if resets_epoch is None else resets_epoch - now,
+        "amount_summary": amount_summary,
         "fields": fields,
-        "display_fields": display_credit_fields(fields),
+        "display_fields": display_credit_fields(fields, consumed),
     }
 
 
@@ -744,15 +829,28 @@ def normalize(raw: dict, now: float):
                 "value": preview_scalar(items),
             }
 
-    limits.sort(
+    # Bara tidsfönstrade nycklar är faktiska användningsgränser. Resten — som
+    # interna kodnamn utan tidsfönster — hamnar under "Övrigt": de visas, men
+    # driver inte panelens procentsiffra. Kriteriet är nyckelns form, inte en
+    # lista med namn, så nya kodnamn hanteras automatiskt.
+    windowed = [item for item in limits if item["window_seconds"] is not None]
+    extras = [item for item in limits if item["window_seconds"] is None]
+
+    windowed.sort(
         key=lambda item: (
-            0 if item["window_seconds"] is not None else 1,
-            item["window_seconds"] or 0,
+            item["window_seconds"],
             0 if not item["scope"] else 1,
             item["label"].casefold(),
         )
     )
-    return limits, credits, sorted(unrecognized.values(), key=lambda e: e["key"])
+    extras.sort(key=lambda item: item["label"].casefold())
+
+    return (
+        windowed,
+        extras,
+        credits,
+        sorted(unrecognized.values(), key=lambda e: e["key"]),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -834,9 +932,9 @@ def build_payload(force: bool):
         (now - fetched_at) if isinstance(fetched_at, (int, float)) else None
     )
 
-    limits, credits, unrecognized = ([], None, [])
+    limits, extras, credits, unrecognized = ([], [], None, [])
     if raw is not None:
-        limits, credits, unrecognized = normalize(raw, now)
+        limits, extras, credits, unrecognized = normalize(raw, now)
 
     percents = [
         item["percent"] for item in limits if isinstance(item["percent"], (int, float))
@@ -856,6 +954,7 @@ def build_payload(force: bool):
         "age_seconds": None if age is None else int(age),
         "error": error.as_dict() if error else None,
         "limits": limits,
+        "extras": extras,
         "credits": credits,
         "unrecognized": unrecognized,
         "max_percent": max_percent,
@@ -940,38 +1039,44 @@ def render_text(payload) -> str:
         return "\n".join(lines)
 
     limits = payload.get("limits") or []
+    extras = payload.get("extras") or []
     credits = payload.get("credits")
 
-    rows = []
-    for limit in limits:
-        rows.append(
+    def make_rows(items):
+        return [
             (
-                limit["label"] + ("" if limit["known"] else " *"),
-                format_percent(limit["percent"]),
-                text_bar(limit["percent"]),
-                format_delta(limit.get("resets_in_seconds")),
+                item["label"] + ("" if item["known"] else " *"),
+                format_percent(item["percent"]),
+                text_bar(item["percent"]),
+                format_delta(item.get("resets_in_seconds")),
             )
-        )
+            for item in items
+        ]
 
-    if not rows and not credits:
+    rows = make_rows(limits)
+    extra_rows = make_rows(extras)
+
+    if not rows and not extra_rows and not credits:
         lines.append("  Svaret innehöll inga gränser.")
 
-    label_width = max([len(row[0]) for row in rows] or [0])
-    percent_width = max([len(row[1]) for row in rows] or [0])
+    # Gemensam bredd för alla avsnitt, så kolumnerna står i linje.
+    all_rows = rows + extra_rows
+    label_width = max([len(row[0]) for row in all_rows] or [0])
+    label_width = max(label_width, len(credits["label"]) if credits else 0)
+    percent_width = max([len(row[1]) for row in all_rows] or [0])
 
-    for label, percent, bar, reset in rows:
-        line = "  %-*s  %*s  %s" % (
-            label_width, label, percent_width, percent, bar
-        )
-        if reset:
-            line += "  återställs %s" % ("nu" if reset == "nu" else "om " + reset)
-        lines.append(line)
+    def emit(row_list, indent="  "):
+        for label, percent, bar, reset in row_list:
+            line = "%s%-*s  %*s  %s" % (
+                indent, label_width, label, percent_width, percent, bar
+            )
+            if reset:
+                line += "  återställs %s" % ("nu" if reset == "nu" else "om " + reset)
+            lines.append(line)
+
+    emit(rows)
 
     if credits:
-        summary = " · ".join(
-            "%s: %s" % (field["label"], field["value"])
-            for field in (credits.get("display_fields") or credits.get("fields", []))
-        )
         line = "  %-*s" % (label_width, credits["label"])
         if credits.get("percent") is not None:
             line += "  %*s  %s" % (
@@ -979,13 +1084,23 @@ def render_text(payload) -> str:
                 format_percent(credits["percent"]),
                 text_bar(credits["percent"]),
             )
+        if credits.get("amount_summary"):
+            line += "  %s" % credits["amount_summary"]
         lines.append(line.rstrip())
-        # Fälten på egen rad — samma upplägg som popupen, och håller radlängden
-        # nere även när credits-objektet har ett dussin fält.
+        # Övriga fält på egen rad — samma upplägg som popupen, och håller
+        # radlängden nere även när credits-objektet har ett dussin fält.
+        summary = " · ".join(
+            "%s: %s" % (field["label"], field["value"])
+            for field in (credits.get("display_fields") or [])
+        )
         if summary:
             lines.append("    " + summary)
 
-    if any(not limit["known"] for limit in limits):
+    if extra_rows:
+        lines.append("  Övrigt (ingen känd tidsgräns — räknas inte i panelen):")
+        emit(extra_rows, indent="    ")
+
+    if any(not item["known"] for item in list(limits) + list(extras)):
         lines.append("  * okänd nyckel — etiketten är autogenererad")
 
     unrecognized = payload.get("unrecognized") or []

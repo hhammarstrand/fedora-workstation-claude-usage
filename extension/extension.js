@@ -486,6 +486,13 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 style_class: 'claude-usage-row-percent',
             }));
         }
+        // Beloppen först: "0,00 / 85,00 EUR" säger mer än råa 8500.
+        if (credits.amount_summary) {
+            heading.add_child(new St.Label({
+                text: credits.amount_summary,
+                style_class: 'claude-usage-row-percent',
+            }));
+        }
         column.add_child(heading);
 
         // display_fields är den kurerade delmängden; riktiga svar har ett dussin
@@ -518,12 +525,13 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         const payload = this._payload;
         const limits = payload?.limits ?? [];
+        const extras = payload?.extras ?? [];
         const credits = payload?.credits ?? null;
 
         if (payload?.ok) {
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-            if (!limits.length && !credits) {
+            if (!limits.length && !extras.length && !credits) {
                 this.menu.addMenuItem(this._makeInfoItem(
                     'Svaret innehöll inga gränser.', 'claude-usage-status'));
             }
@@ -532,8 +540,18 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             if (credits)
                 this.menu.addMenuItem(this._makeCreditsItem(credits));
 
+            // Nycklar utan känt tidsfönster — visas, men driver inte panelen.
+            if (extras.length) {
+                this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+                this.menu.addMenuItem(this._makeInfoItem(
+                    'Övrigt — ingen känd tidsgräns, räknas inte i panelen',
+                    'claude-usage-note'));
+                for (const extra of extras)
+                    this.menu.addMenuItem(this._makeLimitItem(extra));
+            }
+
             const notes = [];
-            if (limits.some(limit => limit.known === false))
+            if ([...limits, ...extras].some(item => item.known === false))
                 notes.push('* okänd nyckel — etiketten är autogenererad');
             const unrecognized = payload.unrecognized ?? [];
             if (unrecognized.length) {
