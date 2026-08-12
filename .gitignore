@@ -1,2 +1,4 @@
+# Byggs av install.sh och tests/run.sh, hör inte i arkivet.
+extension/schemas/gschemas.compiled
 __pycache__/
 *.pyc

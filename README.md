@@ -5,9 +5,17 @@ siffror som Usage-vyn i Claude-appen: sessionsgränsen (5 h), veckogränsen för
 alla modeller, eventuella modellspecifika veckogränser, och credits.
 
 Indikatorn sitter i panelens mittbox, **direkt till höger om klockan**. Den visar
-den högsta aktuella procenten och en färgprick (blå under 70 %, gul från 70 %,
-röd från 90 %). Popupen ger en rad per gräns med etikett, procent, en stapel och
-nedräkning till nästa återställning. Credits ligger sist.
+sessionsgränsens procent, en nedräkning till nästa återställning och en färgprick
+(blå under 70 %, gul från 70 %, röd från 90 %):
+
+```
+ ● 42 % · 2h 5m
+```
+
+Vill du hellre se den högsta av alla gränser går det att byta i
+[inställningarna](#inställningar) — liksom nedräkningen, placeringen och
+hämtningsintervallet. Popupen ger alltid en rad per gräns med etikett, procent,
+en stapel och nedräkning. Credits ligger sist.
 
 ```
 ┌─────────────────────────────────────┐
@@ -25,10 +33,12 @@ nedräkning till nästa återställning. Credits ligger sist.
 │ ███████████████████░                │
 │ återställs om 3 d 11 h              │
 │                                     │
-│ Credits                             │
-│ Used credits: 1.5 · Credit limit: 25│
+│ Credits                       0 %   │
+│ 0,00 / 85,00 EUR                    │
 │ ─────────────────────────────────── │
 │ ⟳  Uppdatera nu                     │
+│ ⬇  Sök efter uppdateringar          │
+│ ⚙  Inställningar                    │
 └─────────────────────────────────────┘
 ```
 
@@ -50,6 +60,8 @@ nedräkning till nästa återställning. Credits ligger sist.
 - [Installation](#installation)
 - [Discovery: kolla den råa JSON:en först](#discovery-kolla-den-råa-jsonen-först)
 - [Generisk parsning och etiketter](#generisk-parsning-och-etiketter)
+- [Inställningar](#inställningar)
+- [Uppdatera tillägget](#uppdatera-tillägget)
 - [Kommandoradsanvändning](#kommandoradsanvändning)
 - [JSON-kontraktet mellan delarna](#json-kontraktet-mellan-delarna)
 - [Tider, cache och rate limiting](#tider-cache-och-rate-limiting)
@@ -88,7 +100,9 @@ Ansvarsfördelningen:
 | Del | Ansvar |
 | --- | --- |
 | `bin/claude-usage` | Läsa token, hämta, tolka svaret generiskt, cacha, rate limita, formatera etiketter, producera stabil JSON |
-| `extension/extension.js` | Köra skriptet, rita panel och popup, hålla timers, städa i `disable()` |
+| `bin/claude-usage-update` | Fråga GitHub om nyare versioner, hämta och köra install.sh |
+| `extension/extension.js` | Köra skripten, rita panel och popup, hålla timers, städa i `disable()` |
+| `extension/prefs.js` | Inställningsdialogen. Skriver bara GSettings; tillägget reagerar. |
 
 All tolkning och alla etiketter ligger i Python-delen. Tillägget renderar den
 `label` skriptet skickar och gör inga egna antaganden om nycklarna — vilket
@@ -98,9 +112,12 @@ betyder att en ändrad endpoint bara kräver ändringar på ett ställe.
 
 ```
 bin/claude-usage            CLI:t. Hämtning, cache, normalisering, etiketter.
+bin/claude-usage-update     Versionskoll och självuppdatering från GitHub.
 extension/
   extension.js              Indikatorn. ESM för GNOME 45+.
-  metadata.json             UUID, namn, shell-version.
+  prefs.js                  Inställningsdialogen. libadwaita.
+  metadata.json             UUID, namn, shell-version, settings-schema.
+  schemas/                  GSettings-schemat. Kompileras av install.sh.
   stylesheet.css            Adwaita-anpassad stil.
 install.sh                  Versionskoll, kopiering, aktivering, rökprovning.
 tools/
@@ -108,8 +125,9 @@ tools/
 tests/
   run.sh                    Kör allt.
   test_claude_usage.py      62 tester mot CLI:t via en lokal stubbserver.
+  test_claude_usage_update.py  19 tester mot uppdateraren, mot en GitHub-stubb.
   js/
-    test_extension.mjs      39 tester mot extension.js.
+    test_extension.mjs      47 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
     loader.mjs              ESM-loader som mappar gi:// och resource:// till stubbarna.
     register.mjs            Registrerar loadern.
@@ -119,7 +137,8 @@ tests/
 
 - Fedora Workstation med **GNOME Shell 45 eller senare** (tillägget använder
   ESM, som infördes i 45)
-- `python3` (finns i Fedora Workstation)
+- `python3` och `glib-compile-schemas` (finns båda i Fedora Workstation;
+  det senare ingår i `glib2`)
 - Claude Code inloggat, så att `~/.claude/.credentials.json` finns
 
 Inga andra beroenden — inga pip-paket, inga npm-paket, inget utanför
@@ -138,8 +157,9 @@ cd fedora-workstation-claude-usage
 
 1. Kontrollerar `gnome-shell --version` och avbryter om major < 45.
 2. Kopierar skriptet till `~/.local/bin/claude-usage` (läge 755).
-3. Kopierar tillägget till
-   `~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io/`.
+3. Kopierar tillägget (inklusive `prefs.js` och `schemas/`) till
+   `~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io/`,
+   kompilerar GSettings-schemat och stämplar vilken commit som installerades.
 4. **Lägger in din major-version i den installerade `metadata.json`** om den inte
    redan står där. Detta är viktigt: en Shell-version som inte listas i
    `shell-version` gör att tillägget tyst inte laddas alls, utan felmeddelande.
@@ -204,8 +224,9 @@ Skriptet är idempotent. Logga ut och in igen för att ladda den nya
 ```bash
 gnome-extensions disable claude-usage@hhammarstrand.github.io
 rm -rf ~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io
-rm -f ~/.local/bin/claude-usage
+rm -f ~/.local/bin/claude-usage ~/.local/bin/claude-usage-update
 rm -rf "$XDG_RUNTIME_DIR/claude-usage"
+dconf reset -f /org/gnome/shell/extensions/claude-usage/
 ```
 
 Logga ut och in igen. `~/.claude/.credentials.json` rörs inte.
@@ -392,6 +413,87 @@ Fältnamnet behöver inte vara `resets_at`: `reset_at`, `resets`, `reset`,
 `next_reset_at` och alla nycklar som innehåller `reset` prövas också. Går tiden
 inte att tolka står det *"ingen känd återställningstid"* i stället för en
 felaktig nedräkning.
+
+## Inställningar
+
+```bash
+gnome-extensions prefs claude-usage@hhammarstrand.github.io
+```
+
+Eller från popupen: **Inställningar**. Även Extensions-appen och GNOME Tweaks
+hittar dialogen.
+
+| Inställning | Standard | Vad den gör |
+| --- | --- | --- |
+| Panelens siffra | Sessionsgränsen | `session` följer gränsen med kortast tidsfönster (5 h). `max` följer den högsta procenten oavsett fönster. |
+| Nedräkning i panelen | På | Lägger `· 2h 5m` efter procenten. Popupen har alltid nedräkningen. |
+| Del av panelen | Mitten | `left`, `center` eller `right`. Mitten lägger indikatorn intill klockan. |
+| Plats inom den delen | 1 | 0 = före klockan, 1 = efter. |
+| Hämta var | 60 s | 30–900 s. Skriptets cache-TTL är 60 s, så tätare hämtning ger inte färskare siffror. |
+| Leta efter nya versioner | På | Frågar GitHub en gång per dygn. Installerar aldrig något själv. |
+
+**Allt slår igenom direkt** — ingen utloggning behövs för att byta inställning.
+Tillägget lyssnar på `changed::`-signalerna: siffra och nedräkning ritas om på
+plats, och byter du panelplacering byggs indikatorn om (den sitter i en
+panelbox och kan inte flyttas levande).
+
+Värdena ligger i GSettings och går att sätta från terminalen också:
+
+```bash
+SCHEMA=org.gnome.shell.extensions.claude-usage
+DIR=~/.local/share/gnome-shell/extensions/claude-usage@hhammarstrand.github.io/schemas
+gsettings --schemadir "$DIR" set $SCHEMA panel-source max
+gsettings --schemadir "$DIR" list-recursively $SCHEMA
+```
+
+Schemat kompileras av `install.sh` med `glib-compile-schemas` (ingår i `glib2`,
+finns alltid på Fedora Workstation). Saknas det kompilerade schemat laddar
+tillägget ändå — med standardvärdena — men dialogen går inte att öppna.
+
+## Uppdatera tillägget
+
+Popupen har **Sök efter uppdateringar**. Hittas en nyare version byts posten mot
+**Installera version `abc1234`**; ingenting hämtas eller installeras förrän du
+klickar. Är automatisk kontroll påslagen görs en tyst koll som mest en gång per
+dygn, när du öppnar popupen.
+
+Samma sak från terminalen:
+
+```bash
+claude-usage-update --check     # finns det något nyare?
+claude-usage-update --apply     # hämta och installera
+claude-usage-update --version   # vad är installerat?
+```
+
+Alla lägen skriver JSON på stdout, även vid fel — det är så tillägget läser dem.
+
+**Så fungerar det.** `--check` frågar GitHubs API efter senaste commiten på
+`main` och jämför med `.installed-commit`, en stämpel som `install.sh` skriver i
+tilläggskatalogen. `--apply` hämtar `codeload.github.com/.../tar.gz/<sha>`,
+packar upp den i en temporär katalog och kör **repots egen `install.sh`**
+därifrån, med commiten i miljön så att stämpeln blir rätt.
+
+Skyddsräcken, eftersom det här hämtar och kör kod:
+
+- Bara HTTPS, och bara det repo som står i `REPO` i skriptet.
+- Nedladdningen är hårt begränsad i storlek (20 MB) och tid (20 s).
+- Arkivet packas upp med `filter='data'`, och varje post kontrolleras först:
+  **symlänkar och hårda länkar vägras**, och en post vars mål hamnar utanför
+  målkatalogen avbryter hela uppackningen.
+- Saknas `install.sh` i arkivet körs ingenting.
+- Utan en stämpel påstår `--check` **aldrig** att en uppdatering finns — den
+  säger `unknown_installed` i stället för att gissa.
+
+**Utloggning krävs ändå.** Uppdateringen lägger nya filer på disk, men GNOME
+Shell laddar tillägg bara vid uppstart — så `logout_required` är alltid `true`
+och popupen säger till. Skriptet i `~/.local/bin/claude-usage` byts däremot ut
+direkt och används vid nästa hämtning.
+
+Föredrar du git går det förstås fortfarande lika bra:
+
+```bash
+git pull && ./install.sh
+```
 
 ## Kommandoradsanvändning
 
@@ -822,9 +924,15 @@ claude-usage --force --text
 - **Endpointen är blockerad från datacenter-IP:n.** Cloudflare svarar `403` med
   HTML. Skriptet fungerar från en vanlig hemmauppkoppling, men inte från en
   server eller container.
-- **Ingen inställningsdialog.** Konfiguration sker genom konstanter i källkoden:
-  `KNOWN_LABELS`, `CACHE_TTL` med flera i `bin/claude-usage`, `PANEL_BOX`,
+- **Inte allt går att ställa in.** Dialogen täcker panelen, hämtningsintervallet
+  och uppdateringskollen. Etiketter och tidsgränser är fortfarande konstanter i
+  källkoden: `KNOWN_LABELS`, `CACHE_TTL` med flera i `bin/claude-usage`,
   `BAR_WIDTH` med flera i `extension/extension.js`.
+- **Uppdateringen kräver utloggning för att synas.** Nya filer hamnar på disk
+  direkt, men Shell laddar tillägg bara vid uppstart. Det gäller alla vägar in —
+  popupen, `install.sh` eller `git pull`.
+- **Dialogen är testad utan att ha visats.** Sidorna byggs och kopplas mot ett
+  riktigt kompilerat schema i testet, men ingen har sett dem på skärmen.
 - **Bara svenska strängar.** Ingen gettext-uppsättning.
 - **Endpointen kan sluta fungera utan förvarning.** Se varningen högst upp.
 
@@ -834,14 +942,14 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (62 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (81 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,
 HTML-svar, 401, utgången token och saknad credentials-fil alla ger cachad data
 eller ett läsbart fel — och att token aldrig läcker i något utdataläge.
 
-**JS-testerna (39 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
+**JS-testerna (47 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
 ESM-loader som mappar `gi://` och `resource://` till `tests/js/stubs.mjs`. De
 verifierar panel, stapelbredder, nedräkningar, felläge, placering i mittboxen
 och att `disable()` städar timers, vakthund och signalhandlers. Stubbarna är

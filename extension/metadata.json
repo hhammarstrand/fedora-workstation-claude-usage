@@ -3,6 +3,7 @@
   "name": "Claude Usage",
   "description": "Visar din Claude-prenumerations användningsgränser i toppanelen: sessionsgräns, veckogränser, modellspecifika veckogränser och credits. Hämtar siffrorna via ~/.local/bin/claude-usage. Endpointen är odokumenterad och kan sluta fungera utan förvarning.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 1,
+  "version": 2,
+  "settings-schema": "org.gnome.shell.extensions.claude-usage",
   "url": "https://github.com/hhammarstrand/fedora-workstation-claude-usage"
 }

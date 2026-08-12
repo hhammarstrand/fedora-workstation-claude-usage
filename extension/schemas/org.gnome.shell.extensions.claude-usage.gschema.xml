@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="org.gnome.shell.extensions.claude-usage.panel-source">
+    <value nick="session" value="0"/>
+    <value nick="max" value="1"/>
+  </enum>
+
+  <schema id="org.gnome.shell.extensions.claude-usage"
+          path="/org/gnome/shell/extensions/claude-usage/">
+
+    <key name="panel-source" enum="org.gnome.shell.extensions.claude-usage.panel-source">
+      <default>'session'</default>
+      <summary>Vilken gräns panelens siffra följer</summary>
+      <description>
+        session: gränsen med kortast tidsfönster, alltså sessionsgränsen (5 h).
+        max: högsta procenten bland alla gränser. Popupen visar alltid alla.
+      </description>
+    </key>
+
+    <key name="show-countdown" type="b">
+      <default>true</default>
+      <summary>Visa nedräkning i panelen</summary>
+      <description>
+        Lägger tiden till nästa återställning intill procenten, i kompakt form
+        (2h 5m). Popupen har alltid nedräkningen, oavsett den här inställningen.
+      </description>
+    </key>
+
+    <key name="refresh-interval" type="i">
+      <range min="30" max="900"/>
+      <default>60</default>
+      <summary>Sekunder mellan automatiska hämtningar</summary>
+      <description>
+        Skriptets cache har samma TTL, så ett kortare intervall än 60 s ger
+        inte färskare siffror — bara fler processtarter.
+      </description>
+    </key>
+
+    <key name="panel-box" type="s">
+      <choices>
+        <choice value="left"/>
+        <choice value="center"/>
+        <choice value="right"/>
+      </choices>
+      <default>'center'</default>
+      <summary>Vilken del av panelen indikatorn sitter i</summary>
+      <description>
+        center placerar den intill klockan, right i statusområdet längst till
+        höger. Ändringen slår igenom direkt.
+      </description>
+    </key>
+
+    <key name="panel-position" type="i">
+      <range min="0" max="20"/>
+      <default>1</default>
+      <summary>Plats inom panelboxen</summary>
+      <description>
+        0 lägger indikatorn före klockan i mittboxen, 1 efter den.
+      </description>
+    </key>
+
+    <key name="check-for-updates" type="b">
+      <default>true</default>
+      <summary>Leta efter nya versioner automatiskt</summary>
+      <description>
+        Frågar GitHub en gång per dygn om det finns en nyare version. Hämtar
+        aldrig något och installerar aldrig något utan att du klickar.
+      </description>
+    </key>
+
+    <key name="last-update-check" type="x">
+      <default>0</default>
+      <summary>Epoch för den senaste versionskontrollen</summary>
+      <description>Internt. Håller dygnsintervallet över omstarter.</description>
+    </key>
+  </schema>
+</schemalist>

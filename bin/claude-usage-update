@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""claude-usage-update — leta efter och installera nya versioner.
+
+Anropas av tillägget (popupen: "Sök efter uppdateringar") och går att köra
+för hand. Skriver alltid JSON på stdout, även vid fel, så att tillägget
+alltid har något att tolka.
+
+    claude-usage-update --check     finns det en nyare version?
+    claude-usage-update --apply     hämta och installera den
+    claude-usage-update --version   vad är installerat?
+
+Hämtar en tarball från GitHub, packar upp den i en temporär katalog och kör
+repots egen install.sh därifrån. Ingenting installeras utan --apply, och
+tillägget kör aldrig --apply utan att användaren har klickat.
+
+Endast Python-stdlib.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+#: Repot uppdateringarna kommer från. Enda källan — ingen annan URL används.
+REPO = os.environ.get(
+    "CLAUDE_USAGE_REPO", "hhammarstrand/fedora-workstation-claude-usage"
+)
+BRANCH = os.environ.get("CLAUDE_USAGE_BRANCH", "main")
+
+#: Överskrivbara för test.
+API_BASE = os.environ.get("CLAUDE_USAGE_API_BASE", "https://api.github.com")
+CODELOAD_BASE = os.environ.get(
+    "CLAUDE_USAGE_CODELOAD_BASE", "https://codeload.github.com"
+)
+
+UUID = "claude-usage@hhammarstrand.github.io"
+EXT_DIR = os.path.join(
+    os.path.expanduser("~"), ".local", "share", "gnome-shell", "extensions", UUID
+)
+#: Skrivs av install.sh vid varje installation. Innehåller senast installerad
+#: commit, så att --check kan jämföra utan att gissa.
+STAMP_PATH = os.path.join(EXT_DIR, ".installed-commit")
+
+HTTP_TIMEOUT = 20.0
+#: En tarball av det här repot är några tiotals kB. Taket stoppar en skenande
+#: eller fientlig nedladdning innan den fyller disken.
+MAX_DOWNLOAD = 20 * 1024 * 1024
+USER_AGENT = "claude-usage-update/1.0"
+
+#: Sekunder mellan automatiska kontroller. Tillägget håller själv reda på tiden.
+CHECK_INTERVAL = 86400
+
+
+class UpdateError(Exception):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def http_json(url: str):
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("User-Agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            body = response.read(MAX_DOWNLOAD)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            raise UpdateError(
+                "rate_limited",
+                "GitHub svarade 403 — troligen för många anrop. Försök senare.",
+            )
+        if exc.code == 404:
+            raise UpdateError("not_found", "Hittade inte repot på GitHub (404).")
+        raise UpdateError("http_error", "GitHub svarade HTTP %d." % exc.code)
+    except urllib.error.URLError as exc:
+        raise UpdateError("network_error", "Nätverksfel: %s" % (exc.reason or "okänd"))
+    except TimeoutError:
+        raise UpdateError("network_error", "Tidsgräns mot GitHub överskreds.")
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise UpdateError("bad_response", "GitHub svarade med något annat än JSON.")
+
+
+def installed_commit():
+    try:
+        with open(STAMP_PATH, encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except OSError:
+        return None
+    return text if re.fullmatch(r"[0-9a-f]{7,40}", text) else None
+
+
+def installed_version():
+    try:
+        with open(os.path.join(EXT_DIR, "metadata.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    version = data.get("version")
+    return version if isinstance(version, int) else None
+
+
+def latest_commit():
+    """-> (sha, kort meddelande). Ett anrop, inget hämtat innehåll."""
+    data = http_json("%s/repos/%s/commits/%s" % (API_BASE, REPO, BRANCH))
+    if not isinstance(data, dict):
+        raise UpdateError("bad_response", "Oväntat svar från GitHub.")
+    sha = data.get("sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise UpdateError("bad_response", "GitHub skickade ingen giltig commit.")
+    message = ""
+    commit = data.get("commit")
+    if isinstance(commit, dict) and isinstance(commit.get("message"), str):
+        message = commit["message"].strip().splitlines()[0]
+    return sha, message
+
+
+def check():
+    sha, message = latest_commit()
+    current = installed_commit()
+    return {
+        "installed_commit": current,
+        "installed_version": installed_version(),
+        "latest_commit": sha,
+        "latest_summary": message,
+        # Utan stämpel vet vi inte vad som är installerat. Att då påstå att en
+        # uppdatering finns vore en gissning — säg hellre nej och låt
+        # användaren köra install.sh en gång för att få en stämpel.
+        "update_available": bool(current) and current != sha,
+        "unknown_installed": current is None,
+    }
+
+
+def safe_extract(archive: tarfile.TarFile, destination: str) -> None:
+    """Packa upp utan att låta någon post ta sig ut ur destinationen."""
+    base = os.path.realpath(destination)
+    for member in archive.getmembers():
+        if member.issym() or member.islnk():
+            raise UpdateError("bad_archive", "Arkivet innehöll en länk — avbryter.")
+        target = os.path.realpath(os.path.join(destination, member.name))
+        if target != base and not target.startswith(base + os.sep):
+            raise UpdateError("bad_archive", "Arkivet pekade utanför katalogen.")
+    # filter='data' finns i 3.12+; ignorera på äldre men behåll kontrollen ovan.
+    try:
+        archive.extractall(destination, filter="data")
+    except TypeError:
+        archive.extractall(destination)
+
+
+def download(sha: str, destination: str) -> str:
+    """Hämta tarballen för sha, packa upp, returnera repots rotkatalog."""
+    url = "%s/%s/tar.gz/%s" % (CODELOAD_BASE, REPO, sha)
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("User-Agent", USER_AGENT)
+    archive_path = os.path.join(destination, "source.tar.gz")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            data = response.read(MAX_DOWNLOAD + 1)
+    except urllib.error.HTTPError as exc:
+        raise UpdateError("http_error", "Nedladdningen gav HTTP %d." % exc.code)
+    except urllib.error.URLError as exc:
+        raise UpdateError("network_error", "Nätverksfel: %s" % (exc.reason or "okänd"))
+    except TimeoutError:
+        raise UpdateError("network_error", "Tidsgräns vid nedladdningen.")
+
+    if len(data) > MAX_DOWNLOAD:
+        raise UpdateError("too_large", "Nedladdningen var orimligt stor — avbryter.")
+    with open(archive_path, "wb") as fh:
+        fh.write(data)
+
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            safe_extract(archive, destination)
+    except tarfile.TarError:
+        raise UpdateError("bad_archive", "Kunde inte packa upp arkivet.")
+
+    roots = [
+        os.path.join(destination, name)
+        for name in os.listdir(destination)
+        if os.path.isdir(os.path.join(destination, name))
+    ]
+    if len(roots) != 1:
+        raise UpdateError("bad_archive", "Oväntat innehåll i arkivet.")
+    return roots[0]
+
+
+def apply_update():
+    sha, message = latest_commit()
+    current = installed_commit()
+    if current == sha:
+        return {
+            "updated": False,
+            "reason": "already_current",
+            "installed_commit": current,
+            "latest_commit": sha,
+            "message": "Redan senaste versionen.",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="claude-usage-update-") as workdir:
+        root = download(sha, workdir)
+        installer = os.path.join(root, "install.sh")
+        if not os.path.isfile(installer):
+            raise UpdateError("bad_archive", "install.sh saknas i den hämtade koden.")
+        os.chmod(installer, 0o755)
+
+        try:
+            completed = subprocess.run(
+                ["bash", installer],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=180,
+                env={**os.environ, "CLAUDE_USAGE_INSTALL_COMMIT": sha},
+            )
+        except subprocess.TimeoutExpired:
+            raise UpdateError("install_failed", "install.sh svarade inte inom 3 min.")
+        except OSError as exc:
+            raise UpdateError("install_failed", "Kunde inte köra install.sh: %s" % exc)
+
+        output = completed.stdout.decode("utf-8", "replace")
+        if completed.returncode != 0:
+            raise UpdateError(
+                "install_failed",
+                "install.sh misslyckades (kod %d)." % completed.returncode,
+            )
+
+    return {
+        "updated": True,
+        "installed_commit": sha,
+        "latest_commit": sha,
+        "latest_summary": message,
+        "installer_output": output.strip().splitlines()[-12:],
+        # Shell laddar tillägget bara vid uppstart — nya filer på disk räcker
+        # inte, oavsett hur uppdateringen kom dit.
+        "logout_required": True,
+        "message": "Uppdaterat. Logga ut och in igen för att ladda den nya versionen.",
+    }
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-usage-update",
+        description="Leta efter och installera nya versioner av Claude Usage.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_const", const="check", dest="mode")
+    mode.add_argument("--apply", action="store_const", const="apply", dest="mode")
+    mode.add_argument("--version", action="store_const", const="version", dest="mode")
+    parser.set_defaults(mode="check")
+    args = parser.parse_args(argv)
+
+    now = time.time()
+    try:
+        if args.mode == "version":
+            payload = {
+                "installed_commit": installed_commit(),
+                "installed_version": installed_version(),
+            }
+        elif args.mode == "apply":
+            payload = apply_update()
+        else:
+            payload = check()
+        payload.update({"ok": True, "error": None, "now": now})
+    except UpdateError as exc:
+        payload = {
+            "ok": False,
+            "error": {"kind": exc.kind, "message": exc.message},
+            "now": now,
+        }
+    except Exception as exc:  # pragma: no cover - sista skyddsnätet
+        payload = {
+            "ok": False,
+            "error": {"kind": "internal_error", "message": str(exc)},
+            "now": now,
+        }
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if payload["ok"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        finally:
+            sys.exit(0)
