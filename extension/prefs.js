@@ -161,6 +161,33 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
         settings.bind('refresh-interval', interval, 'value',
             Gio.SettingsBindFlags.DEFAULT);
 
+        const notifications = new Adw.PreferencesGroup({
+            title: 'Notifieringar',
+            description:
+                'Gäller den gräns panelen följer. En notifiering per ' +
+                'tidsfönster — inte en per hämtning.',
+        });
+        page.add(notifications);
+
+        const threshold = new Adw.SpinRow({
+            title: 'Säg till vid',
+            subtitle: 'Procent av gränsen. 0 stänger av notifieringen.',
+            adjustment: new Gtk.Adjustment({
+                lower: 0, upper: 100, step_increment: 5, page_increment: 10,
+            }),
+        });
+        notifications.add(threshold);
+        settings.bind('notify-threshold', threshold, 'value',
+            Gio.SettingsBindFlags.DEFAULT);
+
+        const onReset = new Adw.SwitchRow({
+            title: 'Säg till när gränsen återställts',
+            subtitle: 'Bara om du låg över tröskeln när fönstret tog slut.',
+        });
+        notifications.add(onReset);
+        settings.bind('notify-on-reset', onReset, 'active',
+            Gio.SettingsBindFlags.DEFAULT);
+
         const updates = new Adw.PreferencesGroup({
             title: 'Programuppdatering',
             description:

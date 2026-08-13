@@ -123,6 +123,8 @@ for (const title of [
     'Del av panelen',
     'Ordning inom den delen',
     'Hämta var',
+    'Säg till vid',
+    'Säg till när gränsen återställts',
     'Leta efter nya versioner automatiskt',
 ]) {
     check(byTitle(title) !== undefined, `raden "${title}" finns`);
@@ -163,6 +165,16 @@ equal(intervalRow.value, 300, 'intervallet följer nyckeln');
 intervalRow.value = 90;
 equal(settings.get_int('refresh-interval'), 90, 'och skriver den');
 
+const thresholdRow = byTitle('Säg till vid');
+settings.set_int('notify-threshold', 75);
+equal(thresholdRow.value, 75, 'tröskeln följer nyckeln');
+thresholdRow.value = 0;
+equal(settings.get_int('notify-threshold'), 0, '0 går att välja — det stänger av');
+
+const resetRow = byTitle('Säg till när gränsen återställts');
+settings.set_boolean('notify-on-reset', false);
+equal(resetRow.active, false, 'återställningsnotisen följer nyckeln');
+
 group('Undertexten för ordning beror på vald del');
 settings.set_string('panel-box', 'center');
 check(positionRow.subtitle.includes('klockan'),
@@ -181,11 +193,17 @@ equal(settings.get_string('panel-source'), 'session',
     'panelen följer sessionen som standard');
 settings.reset('show-countdown');
 equal(settings.get_boolean('show-countdown'), true, 'nedräkningen är på som standard');
+settings.reset('notify-threshold');
+equal(settings.get_int('notify-threshold'), 90, 'tröskeln är 90 % som standard');
+settings.reset('notify-on-reset');
+equal(settings.get_boolean('notify-on-reset'), true,
+    'återställningsnotisen är på som standard');
 
 // Städa upp efter oss, så att en körning inte lämnar spår i dconf.
 for (const key of ['panel-source', 'show-countdown', 'panel-box',
     'panel-position', 'refresh-interval', 'check-for-updates',
-    'last-update-check'])
+    'last-update-check', 'notify-threshold', 'notify-on-reset',
+    'last-notified-window', 'last-notified-reset'])
     settings.reset(key);
 
 print(`\n${checks - failures}/${checks} kontroller gröna`);

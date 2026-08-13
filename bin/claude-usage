@@ -813,6 +813,69 @@ def format_scalar(value):
     return str(value)
 
 
+#: Fält där en gräns kan bära förbrukat respektive tak, i prioritetsordning.
+AMOUNT_USED_FIELDS = ("used", "used_dollars", "spent", "amount_used")
+AMOUNT_LIMIT_FIELDS = ("limit", "limit_dollars", "cap", "total")
+
+
+def money_value(value):
+    """-> (minorenheter, valuta, decimaler) eller None.
+
+    Två former förekommer i verkliga svar. Nästlad, som `spend` använder:
+    {"amount_minor": 8500, "currency": "EUR", "exponent": 2}. Och platt, som
+    five_hour: used_dollars = 1.23 — där är talet redan i hela enheter.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # Platt tal i hela dollar: skala till minorenheter så att samma
+        # formaterare kan användas för båda formerna.
+        return round(float(value) * 100), "$", 2
+    if not isinstance(value, dict):
+        return None
+    minor = value.get("amount_minor")
+    if isinstance(minor, bool) or not isinstance(minor, (int, float)):
+        return None
+    currency = value.get("currency")
+    exponent = value.get("exponent")
+    if not isinstance(currency, str) or not currency.strip():
+        return None
+    if isinstance(exponent, bool) or not isinstance(exponent, int):
+        return None
+    return minor, currency.strip(), exponent
+
+
+def limit_amounts(entry: dict):
+    """Beloppsrad för en gräns, t.ex. '0,00 / 85,00 EUR'. None om inget finns.
+
+    Procenten säger hur mycket som är förbrukat, inte av vad. Finns beloppen
+    i svaret är de värda att visa — men de är ofta null, och då ska raden inte
+    bli tommare av att vi försökte.
+    """
+    used = limit = None
+    for field in AMOUNT_USED_FIELDS:
+        if field in entry:
+            used = money_value(entry[field])
+            if used:
+                break
+    for field in AMOUNT_LIMIT_FIELDS:
+        if field in entry:
+            limit = money_value(entry[field])
+            if limit:
+                break
+
+    if limit and used and limit[1] == used[1]:
+        return "%s / %s" % (
+            format_money(used[0], used[1], used[2], with_currency=False),
+            format_money(limit[0], limit[1], limit[2]),
+        )
+    if limit:
+        return "max %s" % format_money(limit[0], limit[1], limit[2])
+    if used:
+        return format_money(used[0], used[1], used[2])
+    return None
+
+
 def build_limit(key: str, value: dict, now: float, label=None):
     """Ett gränsobjekt -> normaliserad post. Används för både toppnycklar och
     poster som låg i en lista.
@@ -832,6 +895,7 @@ def build_limit(key: str, value: dict, now: float, label=None):
         "utilization_field": util_field,
         "window_seconds": window,
         "scope": suffix,
+        "amount_summary": limit_amounts(value),
         "resets_at": resets_raw,
         "resets_at_epoch": resets_epoch,
         "resets_in_seconds": None if resets_epoch is None else resets_epoch - now,
@@ -1165,6 +1229,7 @@ def render_text(payload) -> str:
                 format_percent(item["percent"]),
                 text_bar(item["percent"]),
                 format_delta(item.get("resets_in_seconds")),
+                item.get("amount_summary"),
             )
             for item in items
         ]
@@ -1182,13 +1247,16 @@ def render_text(payload) -> str:
     percent_width = max([len(row[1]) for row in all_rows] or [0])
 
     def emit(row_list, indent="  "):
-        for label, percent, bar, reset in row_list:
+        for label, percent, bar, reset, amount in row_list:
             line = "%s%-*s  %*s  %s" % (
                 indent, label_width, label, percent_width, percent, bar
             )
             if reset:
                 line += "  återställs %s" % ("nu" if reset == "nu" else "om " + reset)
             lines.append(line)
+            # Procenten säger hur mycket, beloppet säger av vad.
+            if amount:
+                lines.append("%s  %s" % (indent, amount))
 
     emit(rows)
 

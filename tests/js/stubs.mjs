@@ -16,6 +16,7 @@ export const state = {
     subprocess: {stdout: '{}', stderr: '', exitStatus: 0},
     cancellations: 0,
     logs: [],
+    notifications: [],
 };
 
 export function resetState() {
@@ -26,6 +27,7 @@ export function resetState() {
     state.subprocess = {stdout: '{}', stderr: '', exitStatus: 0};
     state.cancellations = 0;
     state.logs = [];
+    state.notifications = [];
 }
 
 const BOX_HAS_ORIENTATION = process.env.STUB_BOX_ORIENTATION !== '0';
@@ -354,6 +356,11 @@ export const PopupMenu = {
 };
 
 export const Main = {
+    /** Main.notify i Shell lägger en transient notis i meddelandefältet.
+     *  Här samlas de i state.notifications så testerna kan räkna dem. */
+    notify(title, body = null) {
+        state.notifications.push({title, body});
+    },
     panel: {
         statusArea: {},
         // Strikt som den riktiga panelen: rollen får bara tas en gång, och

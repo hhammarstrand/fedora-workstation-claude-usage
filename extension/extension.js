@@ -49,6 +49,8 @@ const MENU_MAX_WIDTH = BAR_WIDTH + 110;
 const DEFAULTS = {
     'panel-source': 'session',
     'show-countdown': true,
+    'notify-threshold': 90,
+    'notify-on-reset': true,
     'refresh-interval': 60,
     'panel-box': 'center',
     'panel-position': 1,
@@ -215,6 +217,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._updateCancellable = null;
         this._updateWatchdogId = 0;
         this._statusIdleId = 0;
+        // Föregående fönster, för att kunna se när det byts ut.
+        this._seenWindowEpoch = null;
+        this._seenWindowPercent = null;
         // Får vara null: testerna kör utan GSettings, och en trasig
         // schemainstallation ska ge standardvärden i stället för ett undantag.
         this._settings = settings;
@@ -436,6 +441,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 throw new Error('claude-usage gav oväntad JSON');
             this._payload = payload;
             this._spawnError = null;
+            this._checkNotifications();
         } catch (error) {
             if (this._disposed)
                 return;
@@ -496,8 +502,14 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         const primary = hasData ? this._primaryLimit(limits) : null;
         if (primary && typeof primary.percent === 'number') {
-            this._panelPercentText = `${Math.round(primary.percent)} %`;
-            dotClass = severityClass(primary.severity);
+            // 100 % betyder att nästa kommando faktiskt nekas. Att visa det
+            // som ännu en röd siffra döljer skillnaden mellan "snart slut"
+            // och "slut" — och det är nedräkningen man vill ha då.
+            const spent = primary.percent >= 100;
+            this._panelPercentText = spent
+                ? 'slut'
+                : `${Math.round(primary.percent)} %`;
+            dotClass = spent ? 'claude-usage-full' : severityClass(primary.severity);
             if (typeof primary.resets_at_epoch === 'number')
                 this._panelEpoch = primary.resets_at_epoch;
         } else if (this._spawnError || payload?.error) {
@@ -597,6 +609,15 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             y_expand: true,
         });
         track.add_child(fill);
+
+        // Beloppet först när det finns: procenten säger hur mycket, beloppet
+        // säger av vad. Ofta null i svaret — då blir raden inte tommare.
+        if (limit.amount_summary) {
+            heading.add_child(new St.Label({
+                text: limit.amount_summary,
+                style_class: 'claude-usage-row-percent',
+            }));
+        }
 
         const footer = dimLabel(
             this._resetText(limit.resets_at_epoch), 'claude-usage-row-reset');
@@ -908,6 +929,73 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 this._rebuildMenu();
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    // ------------------------------------------------------- notifieringar
+
+    /** Läs/skriv en epoch-nyckel utan att fälla hämtningen om schemat saknas. */
+    _readEpoch(key) {
+        try {
+            return this._settings?.get_int64(key) ?? 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    _writeEpoch(key, value) {
+        try {
+            this._settings?.set_int64(key, Math.floor(value));
+        } catch {
+            // Utan schema blir notifieringen bara oregelbunden, inte trasig.
+        }
+    }
+
+    /**
+     * Två notifieringar, båda av data vi redan har.
+     *
+     * Tröskeln säger till innan du blir avbruten. Återställningen säger till
+     * när du kan fortsätta — det är den som är värd något, för den vet du
+     * annars inte utan att sitta och titta på panelen.
+     *
+     * Avstämningen sker mot fönstrets resets_at, inte mot en tidsstämpel: ett
+     * fönster ger exakt en notifiering, oavsett hur många gånger vi hämtar,
+     * och det överlever både skärmlås och utloggning eftersom nyckeln ligger
+     * i GSettings.
+     */
+    _checkNotifications() {
+        const limits = this._payload?.limits ?? [];
+        const primary = this._primaryLimit(limits);
+        const epoch = primary?.resets_at_epoch;
+        const percent = primary?.percent;
+        if (typeof epoch !== 'number' || typeof percent !== 'number')
+            return;
+
+        const threshold = this._setting('notify-threshold');
+        const previousEpoch = this._seenWindowEpoch;
+        const previousPercent = this._seenWindowPercent;
+        this._seenWindowEpoch = epoch;
+        this._seenWindowPercent = percent;
+
+        // Fönstret har bytts ut sedan förra hämtningen, och du låg över
+        // tröskeln i det gamla — alltså blev du sannolikt begränsad.
+        if (this._setting('notify-on-reset') &&
+            previousEpoch !== null && epoch > previousEpoch &&
+            threshold > 0 && previousPercent >= threshold &&
+            this._readEpoch('last-notified-reset') !== epoch) {
+            this._writeEpoch('last-notified-reset', epoch);
+            Main.notify(
+                `${primary.label} är återställd`,
+                'Du kan köra Claude igen.');
+        }
+
+        if (threshold > 0 && percent >= threshold &&
+            this._readEpoch('last-notified-window') !== epoch) {
+            this._writeEpoch('last-notified-window', epoch);
+            const delta = formatDelta(epoch - Date.now() / 1000);
+            Main.notify(
+                `${primary.label}: ${formatPercent(percent)} använt`,
+                delta ? `Återställs om ${delta}.` : null);
+        }
     }
 
     _stampCheck() {

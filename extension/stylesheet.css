@@ -52,6 +52,15 @@
     background-color: #e01b24;
 }
 
+/* Slut, inte bara nästan: 100 % betyder att nästa kommando faktiskt nekas.
+ * Formen skiljer sig — en fyrkant, inte en prick — så att skillnaden syns
+ * även för den som inte skiljer rött från gult. Panelen skriver dessutom
+ * "slut" i stället för siffran. */
+.claude-usage-dot.claude-usage-full {
+    background-color: #e01b24;
+    border-radius: 0;
+}
+
 /* Cachad data uttrycks med opacitet på pricken och siffran (se _updatePanel),
  * inte med `border` här: St lägger ramen utanför width/height, så pricken
  * skulle byta storlek varje gång data blev gammal. Klassen finns kvar som
