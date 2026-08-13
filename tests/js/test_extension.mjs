@@ -358,6 +358,117 @@ test('destroy kopplar bort inställningssignalerna', async () => {
     assert.equal(settings.handlers.size, 0, 'inget får ligga kvar');
 });
 
+// -------------------------------------------------------------- notifieringar
+
+/** Bygg om indikatorn med nytt svar, som en vanlig hämtning hade gjort. */
+async function refreshWith(indicator, object) {
+    setStdout(object);
+    await indicator._refresh(true);
+    await flush();
+}
+
+test('tröskeln ger en notifiering — men bara en per tidsfönster', async () => {
+    const epoch = Date.now() / 1000 + 3600;
+    const settings = fakeSettings({'notify-threshold': 90});
+    const indicator = await buildWith(settings, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 50, 'ok',
+            {resets_at_epoch: epoch})],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 0, '50 % ska inte notifiera');
+
+    await refreshWith(indicator, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 93, 'crit',
+            {resets_at_epoch: epoch})],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 1);
+    assert.match(state.notifications[0].title, /Session \(5 h\)/);
+    assert.match(state.notifications[0].title, /93 %/);
+
+    // Samma fönster igen: inget nytt, oavsett hur många hämtningar som görs.
+    await refreshWith(indicator, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 97, 'crit',
+            {resets_at_epoch: epoch})],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 1, 'en per fönster, inte per hämtning');
+    indicator.destroy();
+});
+
+test('återställningen aviseras bara om man låg över tröskeln', async () => {
+    const first = Date.now() / 1000 + 600;
+    const settings = fakeSettings({'notify-threshold': 90});
+    const indicator = await buildWith(settings, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 95, 'crit',
+            {resets_at_epoch: first})],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 1, 'tröskeln passerades');
+
+    // Fönstret byts ut: resets_at hoppar framåt och procenten faller.
+    await refreshWith(indicator, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 2, 'ok',
+            {resets_at_epoch: first + 18000})],
+        credits: null,
+    }));
+    const reset = state.notifications.find(n => n.title.includes('återställd'));
+    assert.ok(reset, 'ska säga till att gränsen är återställd');
+    assert.match(reset.body, /köra Claude igen/);
+    indicator.destroy();
+});
+
+test('ett nytt fönster utan föregående tryck ger ingen notifiering', async () => {
+    const first = Date.now() / 1000 + 600;
+    const settings = fakeSettings({'notify-threshold': 90});
+    const indicator = await buildWith(settings, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 10, 'ok',
+            {resets_at_epoch: first})],
+        credits: null,
+    }));
+    await refreshWith(indicator, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 12, 'ok',
+            {resets_at_epoch: first + 18000})],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 0,
+        'en återställning man inte märkte är inte värd en notis');
+    indicator.destroy();
+});
+
+test('tröskel 0 stänger av notifieringarna helt', async () => {
+    const settings = fakeSettings({'notify-threshold': 0});
+    const indicator = await buildWith(settings, payload({
+        limits: [limit('five_hour', 'Session (5 h)', 100, 'crit')],
+        credits: null,
+    }));
+    assert.equal(state.notifications.length, 0);
+    indicator.destroy();
+});
+
+test('100 % visas som slut, med egen prickform', async () => {
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 100, 'crit')],
+        credits: null,
+        max_percent: 100,
+        max_severity: 'crit',
+    }));
+    assert.match(indicator._panelLabel.text, /^slut · /,
+        '"slut" säger något annat än ännu en röd siffra');
+    assert.match(indicator._dot.style_class, /claude-usage-full/);
+    indicator.destroy();
+});
+
+test('beloppet visas på gränsraden när det finns', async () => {
+    const indicator = await build(payload({
+        limits: [limit('five_hour', 'Session (5 h)', 25, 'ok',
+            {amount_summary: '1,23 / 5,00 $'})],
+        credits: null,
+    }));
+    assert.ok(menuTexts(indicator).includes('1,23 / 5,00 $'));
+    indicator.destroy();
+});
+
 // ------------------------------------------------------------------- popupen
 
 test('popupen får en rad per gräns, credits sist, plus Uppdatera nu', async () => {
@@ -823,4 +934,51 @@ test('enable() lägger indikatorn i panelen och disable() tar bort den', async (
 
     // disable() två gånger ska vara ofarligt.
     assert.doesNotThrow(() => extension.disable());
+});
+
+test('enable() följer panel-box och panel-position ur inställningarna', async () => {
+    resetState();
+    setStdout(payload());
+
+    const extension = new Extension({uuid: 'claude-usage@test'});
+    extension.__settings = fakeSettings({'panel-box': 'right', 'panel-position': 0});
+    extension.enable();
+    await flush();
+
+    const {Main} = await import('./stubs.mjs');
+    const entry = Main.panel.statusArea['claude-usage@test'];
+    assert.equal(entry.box, 'right');
+    assert.equal(entry.position, 0);
+
+    extension.disable();
+});
+
+test('en ändrad placering flyttar indikatorn utan att rollen krockar', async () => {
+    resetState();
+    setStdout(payload());
+
+    const settings = fakeSettings();
+    const extension = new Extension({uuid: 'claude-usage@test'});
+    extension.__settings = settings;
+    extension.enable();
+    await flush();
+
+    const {Main} = await import('./stubs.mjs');
+    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'center');
+    const first = extension._indicator;
+
+    // Indikatorn sitter i en panelbox och kan inte flyttas levande — den
+    // byggs om. Panelstubben kastar på dubbeltagen roll, precis som den
+    // riktiga, så testet fångar en glömd destroy.
+    settings.set_string('panel-box', 'right');
+    await flush();
+
+    assert.equal(Main.panel.statusArea['claude-usage@test'].box, 'right',
+        'indikatorn ska ha flyttats');
+    assert.notEqual(extension._indicator, first, 'en ny indikator ska ha byggts');
+    assert.ok(first.destroyed, 'den gamla ska vara förstörd');
+    assert.equal(state.timers.size, 2, 'inga timers får bli kvar från den gamla');
+
+    extension.disable();
+    assert.equal(state.timers.size, 0);
 });

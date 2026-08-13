@@ -59,6 +59,37 @@
       </description>
     </key>
 
+    <key name="notify-threshold" type="i">
+      <range min="0" max="100"/>
+      <default>90</default>
+      <summary>Procent då en notifiering skickas</summary>
+      <description>
+        Skickas en gång per tidsfönster för den gräns panelen följer. 0 stänger
+        av tröskelnotifieringen helt.
+      </description>
+    </key>
+
+    <key name="notify-on-reset" type="b">
+      <default>true</default>
+      <summary>Säg till när gränsen har återställts</summary>
+      <description>
+        Bara om du faktiskt låg över tröskeln när fönstret tog slut — annars
+        vore det en notifiering om ingenting.
+      </description>
+    </key>
+
+    <key name="last-notified-window" type="x">
+      <default>0</default>
+      <summary>resets_at för fönstret som redan gett en tröskelnotifiering</summary>
+      <description>Internt. Hindrar en notifiering per hämtning.</description>
+    </key>
+
+    <key name="last-notified-reset" type="x">
+      <default>0</default>
+      <summary>resets_at för den återställning som redan aviserats</summary>
+      <description>Internt. Överlever utloggning och skärmlås.</description>
+    </key>
+
     <key name="check-for-updates" type="b">
       <default>true</default>
       <summary>Leta efter nya versioner automatiskt</summary>

@@ -35,6 +35,21 @@ else
     echo "  Installera node för att köra testerna för extension.js."
 fi
 
+# Dialogen går inte att testa med node-stubbarna — den är libadwaita, inte St.
+# gjs finns på varje GNOME-maskin och är samma motor som Shell kör.
+if command -v gjs >/dev/null 2>&1 && command -v glib-compile-schemas >/dev/null 2>&1 \
+   && [ -f /usr/share/gnome-shell/org.gnome.Shell.Extensions.src.gresource ]; then
+    bold "gjs: extension/prefs.js"
+    glib-compile-schemas extension/schemas
+    # memory-backend: testet ska inte röra användarens riktiga inställningar.
+    GSETTINGS_BACKEND=memory \
+    GI_TYPELIB_PATH=/usr/lib64/gnome-shell/girepository-1.0 \
+    LD_LIBRARY_PATH=/usr/lib64/gnome-shell \
+        gjs -m tests/gjs/test_prefs.js || FAILED=1
+else
+    bold "gjs: hoppas över (gjs, glib-compile-schemas eller Extensions-resursen saknas)"
+fi
+
 bold "Syntaxkontroll"
 python3 -m py_compile bin/claude-usage && echo "  ✓ bin/claude-usage"
 python3 -m py_compile bin/claude-usage-update && echo "  ✓ bin/claude-usage-update"

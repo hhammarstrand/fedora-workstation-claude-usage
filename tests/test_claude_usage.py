@@ -747,6 +747,103 @@ class TestKindListShape(UsageTestCase):
         self.assertAlmostEqual(by_key["seven_day_sonnet"], 20.0)
 
 
+class TestLimitAmounts(UsageTestCase):
+    """Belopp på gränsraderna. Procenten säger hur mycket, beloppet av vad.
+
+    Två former förekommer i verkliga svar: platta *_dollars på five_hour (som
+    dock är null på alla konton vi sett), och en nästlad
+    {amount_minor, currency, exponent} på spend.
+    """
+
+    def test_nested_minor_units_are_formatted(self):
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "spend": {
+                    "percent": 0,
+                    "used": {"amount_minor": 0, "currency": "EUR", "exponent": 2},
+                    "limit": {"amount_minor": 8500, "currency": "EUR", "exponent": 2},
+                },
+            }))
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        entry = payload["extras"][0]
+        self.assertEqual(entry["key"], "spend")
+        self.assertEqual(entry["amount_summary"], "0,00 / 85,00 EUR")
+
+    def test_flat_dollar_fields_are_formatted(self):
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "five_hour": {
+                    "utilization": 25,
+                    "used_dollars": 1.23,
+                    "limit_dollars": 5,
+                    "resets_at": "2026-08-13T22:00:00Z",
+                },
+            }))
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertEqual(payload["limits"][0]["amount_summary"], "1,23 / 5,00 $")
+
+    def test_null_amounts_produce_no_row(self):
+        """Riktiga svar har null i alla dollarfält — raden ska inte bli tommare."""
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "five_hour": {
+                    "utilization": 3,
+                    "used_dollars": None,
+                    "limit_dollars": None,
+                    "remaining_dollars": None,
+                    "resets_at": "2026-08-13T22:00:00Z",
+                },
+            }))
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertIsNone(payload["limits"][0]["amount_summary"])
+
+    def test_limit_without_used_says_max(self):
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "five_hour": {"utilization": 10, "limit_dollars": 20},
+            }))
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertEqual(payload["limits"][0]["amount_summary"], "max 20,00 $")
+
+    def test_mismatched_currencies_are_not_mixed(self):
+        """Två valutor i samma rad vore fel siffra, inte bara ful."""
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "spend": {
+                    "percent": 5,
+                    "used": {"amount_minor": 100, "currency": "USD", "exponent": 2},
+                    "limit": {"amount_minor": 8500, "currency": "EUR", "exponent": 2},
+                },
+            }))
+
+        self.serve(responder)
+        payload, _ = self.run_json("--force")
+        self.assertEqual(payload["extras"][0]["amount_summary"], "max 85,00 EUR")
+
+    def test_amount_appears_in_text_output(self):
+        def responder(_n):
+            return (200, "application/json", json.dumps({
+                "five_hour": {
+                    "utilization": 25,
+                    "used_dollars": 1.23,
+                    "limit_dollars": 5,
+                    "resets_at": "2026-08-13T22:00:00Z",
+                },
+            }))
+
+        self.serve(responder)
+        result = self.run_script("--text", "--force")
+        self.assertIn("1,23 / 5,00 $", result.stdout)
+
+
 class TestCaching(UsageTestCase):
     def test_cache_file_is_0600(self):
         self.serve(ok_json)
@@ -1097,13 +1194,32 @@ class TestCliContract(UsageTestCase):
         with open(SCRIPT, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.readline().strip(), "#!/usr/bin/env python3")
 
+    def test_plain_http_endpoint_is_refused(self):
+        """Token går som Bearer-header — den får aldrig gå okrypterad.
+
+        CLAUDE_USAGE_ENDPOINT kan sättas av vad som helst som når miljön, så
+        kontrollen ligger i skriptet och inte i dokumentationen.
+        """
+        result = self.run_script(
+            "--json", "--force", endpoint="http://example.invalid/usage")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "insecure_endpoint")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_localhost_http_is_allowed_for_testing(self):
+        """Annars vore testsviten själv omöjlig att köra."""
+        self.serve(ok_json)
+        payload, _ = self.run_json("--force")
+        self.assertTrue(payload["ok"])
+
     def test_stdlib_only(self):
         with open(SCRIPT, "r", encoding="utf-8") as fh:
             source = fh.read()
         imported = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_.]+)", source, re.M))
         allowed = {
             "__future__", "argparse", "json", "os", "re", "sys", "tempfile",
-            "time", "urllib.error", "urllib.request", "datetime",
+            "time", "urllib.error", "urllib.parse", "urllib.request", "datetime",
         }
         self.assertTrue(
             imported <= allowed, "otillåtna importer: %s" % (imported - allowed)

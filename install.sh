@@ -88,10 +88,21 @@ if [ -n "${CLAUDE_USAGE_INSTALL_COMMIT:-}" ]; then
 elif command -v git >/dev/null 2>&1 \
      && git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     STAMP="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+    # Med lokala ändringar motsvarar det installerade inte commiten. Märk
+    # stämpeln: claude-usage-update accepterar bara rena sha:n och behandlar
+    # den här som "vet inte" — bättre än att påstå att allt är à jour.
+    if [ -n "$STAMP" ] && ! git -C "$SRC_DIR" diff --quiet HEAD 2>/dev/null; then
+        STAMP="$STAMP-dirty"
+    fi
 fi
 if [ -n "$STAMP" ]; then
     printf '%s\n' "$STAMP" > "$EXT_DIR/.installed-commit"
-    ok "Version stämplad: ${STAMP:0:12}"
+    case "$STAMP" in
+        # Kapa inte bort -dirty i utskriften: det är just den delen som gör
+        # att uppdateringskollen säger "vet inte" i stället för "à jour".
+        *-dirty) ok "Version stämplad: ${STAMP:0:12}-dirty (lokala ändringar)" ;;
+        *)       ok "Version stämplad: ${STAMP:0:12}" ;;
+    esac
 else
     rm -f "$EXT_DIR/.installed-commit"
     info "Ingen commit att stämpla (inget git-arkiv) — uppdateringskollen"

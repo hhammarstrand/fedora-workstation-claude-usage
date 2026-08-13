@@ -61,6 +61,7 @@ en stapel och nedräkning. Credits ligger sist.
 - [Discovery: kolla den råa JSON:en först](#discovery-kolla-den-råa-jsonen-först)
 - [Generisk parsning och etiketter](#generisk-parsning-och-etiketter)
 - [Inställningar](#inställningar)
+- [Notifieringar](#notifieringar)
 - [Uppdatera tillägget](#uppdatera-tillägget)
 - [Kommandoradsanvändning](#kommandoradsanvändning)
 - [JSON-kontraktet mellan delarna](#json-kontraktet-mellan-delarna)
@@ -124,10 +125,12 @@ tools/
   diagnose.sh               Samlar allt om varför tillägget inte syns.
 tests/
   run.sh                    Kör allt.
-  test_claude_usage.py      62 tester mot CLI:t via en lokal stubbserver.
-  test_claude_usage_update.py  19 tester mot uppdateraren, mot en GitHub-stubb.
+  test_claude_usage.py      70 tester mot CLI:t via en lokal stubbserver.
+  test_claude_usage_update.py  20 tester mot uppdateraren, mot en GitHub-stubb.
+  gjs/
+    test_prefs.js           33 kontroller av dialogen, i gjs mot riktiga Gtk/Adw.
   js/
-    test_extension.mjs      47 tester mot extension.js.
+    test_extension.mjs      55 tester mot extension.js.
     stubs.mjs               Stubbar för St, GLib, Gio, Clutter, PopupMenu m.fl.
     loader.mjs              ESM-loader som mappar gi:// och resource:// till stubbarna.
     register.mjs            Registrerar loadern.
@@ -430,6 +433,8 @@ hittar dialogen.
 | Del av panelen | Mitten | `left`, `center` eller `right`. Mitten lägger indikatorn intill klockan. |
 | Plats inom den delen | 1 | 0 = före klockan, 1 = efter. |
 | Hämta var | 60 s | 30–900 s. Skriptets cache-TTL är 60 s, så tätare hämtning ger inte färskare siffror. |
+| Säg till vid | 90 % | Notifiering när gränsen panelen följer passerar tröskeln. 0 stänger av. |
+| Säg till när gränsen återställts | På | Bara om du låg över tröskeln när fönstret tog slut. |
 | Leta efter nya versioner | På | Frågar GitHub en gång per dygn. Installerar aldrig något själv. |
 
 **Allt slår igenom direkt** — ingen utloggning behövs för att byta inställning.
@@ -449,6 +454,28 @@ gsettings --schemadir "$DIR" list-recursively $SCHEMA
 Schemat kompileras av `install.sh` med `glib-compile-schemas` (ingår i `glib2`,
 finns alltid på Fedora Workstation). Saknas det kompilerade schemat laddar
 tillägget ändå — med standardvärdena — men dialogen går inte att öppna.
+
+## Notifieringar
+
+Panelen kräver att du tittar på den. Notifieringarna är till för det motsatta —
+att få veta något du inte satt och väntade på:
+
+- **Tröskeln** (standard 90 %) säger till innan du blir avbruten, så att du
+  hinner avsluta det du håller på med.
+- **Återställningen** säger till när du kan fortsätta. Den skickas bara om du
+  faktiskt låg över tröskeln när fönstret tog slut — en återställning du inte
+  märkte är inte värd en notis.
+
+Avstämningen sker mot fönstrets `resets_at`, inte mot en tidsstämpel. Det ger
+**exakt en notifiering per tidsfönster** oavsett hur många gånger tillägget
+hämtar data, och eftersom nyckeln ligger i GSettings överlever den både
+skärmlås och utloggning. Nyss inloggad med 95 % kvar sedan i går ger alltså
+ingen dubblett.
+
+Vid 100 % byter panelen läge: siffran ersätts av **`slut`** och pricken blir en
+fyrkant i stället för en rund prick. Skillnaden mellan "nästan slut" och "slut"
+är den mellan att hinna avsluta och att bli nekad — den ska inte bäras av två
+nyanser rött, och formen syns även för den som inte skiljer dem åt.
 
 ## Uppdatera tillägget
 
@@ -583,6 +610,7 @@ tillägget. `schema` räknas upp om formen bryts.
 | `utilization_field` | sträng | Vilket fältnamn procenten kom ifrån |
 | `window_seconds` | int \| null | Tolkad fönsterlängd, för sortering |
 | `scope` | sträng \| null | Modellsuffix, t.ex. `opus` |
+| `amount_summary` | sträng \| null | Beloppsrad, t.ex. `"0,00 / 85,00 EUR"` |
 | `resets_at` | valfri | Serverns värde, ordagrant |
 | `resets_at_epoch` | float \| null | Tolkad epoch |
 | `resets_in_seconds` | float \| null | Sekunder kvar när utdatan skapades |
@@ -629,6 +657,7 @@ Stabila strängar, avsedda att jämföras mot i kod:
 | `server_error` | HTTP 5xx |
 | `http_error` | Annan oväntad status |
 | `network_error` | Uppkoppling, DNS eller tidsgräns |
+| `insecure_endpoint` | `CLAUDE_USAGE_ENDPOINT` pekar på annat än https (loopback undantaget) |
 | `bad_response` | Svaret var inte JSON, eller inte ett objekt |
 | `internal_error` | Bugg i skriptet |
 
@@ -658,6 +687,11 @@ mest ett per 15 s om du sitter och klickar.
 - Token läses från `~/.claude/.credentials.json`
   (`claudeAiOauth.accessToken`). **Filen läses bara, aldrig skrivs** — Claude
   Code sköter förnyelsen själv.
+- **Token skickas bara över https.** Den går som `Authorization: Bearer` mot
+  `CLAUDE_USAGE_ENDPOINT`, och den variabeln kan sättas av vad som helst som
+  når processens miljö. Skriptet vägrar därför alla scheman utom `https` —
+  utom mot `localhost`/`127.0.0.1`, som testsviten behöver. Utan den
+  kontrollen räckte en satt miljövariabel för att skicka token i klartext.
 - Bara `accessToken` läses. `refreshToken` rörs inte.
 - **Token skrivs aldrig ut** — inte i loggar, inte i felmeddelanden. Alla
   felsträngar går genom en scrubber som maskar både den kända token och allt som
@@ -911,9 +945,11 @@ claude-usage --force --text
   räknas inte i panelen. (`nimbus_quill` har till och med `resets_at` och samma
   dollar-fält som `five_hour`, men kriteriet är nyckelns form — ett okänt
   kodnamn ska inte kunna färga panelen röd.)
-- **Dollar-fälten används inte.** `five_hour` och `seven_day` innehåller
-  `used_dollars`, `limit_dollars` och `remaining_dollars`. Bara `utilization`
-  visas; beloppen finns i `--raw`.
+- **Dollar-fälten är tomma.** `five_hour` och `seven_day` har `used_dollars`,
+  `limit_dollars` och `remaining_dollars` — men de är `null` på alla konton vi
+  sett. Parsern renderar dem om de dyker upp; i praktiken är det bara `spend`
+  som bär belopp idag, i den nästlade formen
+  `{amount_minor, currency, exponent}`.
 - **Grafiken är inte sedd på en körande GNOME.** Mått och färger är valda utifrån
   Adwaitas palett och St:s begränsningar, inte utifrån en skärmdump. API-anropen
   är däremot avstämda mot källkoden i GNOME Shell 50 (`panelMenu.js` använder
@@ -931,9 +967,24 @@ claude-usage --force --text
 - **Uppdateringen kräver utloggning för att synas.** Nya filer hamnar på disk
   direkt, men Shell laddar tillägg bara vid uppstart. Det gäller alla vägar in —
   popupen, `install.sh` eller `git pull`.
-- **Dialogen är testad utan att ha visats.** Sidorna byggs och kopplas mot ett
-  riktigt kompilerat schema i testet, men ingen har sett dem på skärmen.
+- **Dialogen är testad utan att ha visats.** `tests/gjs/test_prefs.js` bygger
+  sidorna i gjs mot riktiga Gtk/Adw och ett riktigt kompilerat schema, och
+  kontrollerar att varje rad speglar sin nyckel åt båda hållen — men ingen har
+  sett dem på en skärm.
+- **Uppdateringen verifierar ingen signatur.** Den litar på https och på att
+  repot är ditt. Den som kan pusha till repot kan därmed köra kod på maskinen
+  vid nästa uppdatering — samma förtroendemodell som `git pull && ./install.sh`,
+  men värd att veta om innan man slår på automatisk kontroll.
 - **Bara svenska strängar.** Ingen gettext-uppsättning.
+- **Inte publicerad på extensions.gnome.org, och bör troligen inte bli det.**
+  Granskningsreglerna säger att *"Extensions **MUST NOT** include binary
+  executables or libraries"* och att *"Scripts **MUST** be written in GJS,
+  unless absolutely necessary"*. Hela poängen med `bin/claude-usage` är att
+  tokenhanteringen ligger utanför GJS — ett EGO-paket kan inte innehålla den,
+  och utan den gör tillägget ingenting. Alternativet vore att skriva om
+  hämtning, cache och tokenläsning i GJS inuti tillägget, vilket är precis den
+  arkitektur repot medvetet undviker. Priset för EGO är alltså inte gettext
+  utan säkerhetsmodellen. Den inbyggda uppdateringen täcker behovet i stället.
 - **Endpointen kan sluta fungera utan förvarning.** Se varningen högst upp.
 
 ## Utveckling och tester
@@ -942,14 +993,14 @@ claude-usage --force --text
 ./tests/run.sh
 ```
 
-**Python-testerna (81 st)** kör CLI:t som en riktig subprocess mot en lokal
+**Python-testerna (90 st)** kör CLI:t som en riktig subprocess mot en lokal
 `http.server`-stubb, så att det som testas är exakt det gränssnitt tillägget
 anropar. De täcker generisk parsning av okända nycklar, sortering,
 tidsstämpelformat, cache-rättigheter och TTL, samt att 429, nätverksfel,
 HTML-svar, 401, utgången token och saknad credentials-fil alla ger cachad data
 eller ett läsbart fel — och att token aldrig läcker i något utdataläge.
 
-**JS-testerna (47 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
+**JS-testerna (55 st)** kör `extension.js` mot stubbade GNOME-bibliotek via en
 ESM-loader som mappar `gi://` och `resource://` till `tests/js/stubs.mjs`. De
 verifierar panel, stapelbredder, nedräkningar, felläge, placering i mittboxen
 och att `disable()` städar timers, vakthund och signalhandlers. Stubbarna är

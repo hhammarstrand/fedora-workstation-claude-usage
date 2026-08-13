@@ -346,6 +346,25 @@ class TestCliContract(UpdaterTestCase):
                     "%s ligger utanför stdlib" % module,
                 )
 
+    def test_plain_http_source_is_refused(self):
+        """Uppdateraren hämtar kod som körs — bara https, utom mot loopback."""
+        env = dict(os.environ)
+        env.update(
+            {
+                "HOME": self.home,
+                "CLAUDE_USAGE_REPO": REPO,
+                "CLAUDE_USAGE_API_BASE": "http://example.invalid",
+                "CLAUDE_USAGE_CODELOAD_BASE": "http://example.invalid",
+            }
+        )
+        result = subprocess.run(
+            [sys.executable, UPDATER, "--check"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["kind"], "insecure_source")
+
     def test_modes_are_mutually_exclusive(self):
         self.serve(self.default_responder())
         result = self.run_updater("--check", "--apply")
